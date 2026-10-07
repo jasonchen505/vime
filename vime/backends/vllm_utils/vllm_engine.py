@@ -17,6 +17,7 @@ from vime.backends.vllm_utils.external import get_server_info
 from vime.ray.ray_actor import RayActor
 from vime.utils.http_utils import _wrap_ipv6, get_host_info
 
+
 logger = logging.getLogger(__name__)
 
 _VLLM_WAKE_TAGS = frozenset({"weights", "kv_cache"})
@@ -104,10 +105,11 @@ def _run_vllm_server(kwargs: dict, env: dict) -> None:
     ServeSubcommand.cmd(args)
 
 
-def _wait_server_healthy(base_url, is_process_alive):
+def _wait_server_healthy(base_url, is_process_alive, probe_timeout: float = 5.0):
+    
     while True:
         try:
-            response = requests.get(f"{base_url}/health")
+            response = requests.get(f"{base_url}/health", timeout=probe_timeout)
             if response.status_code == 200:
                 break
         except requests.RequestException:
