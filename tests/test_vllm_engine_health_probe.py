@@ -18,20 +18,26 @@ from unittest import mock
 import requests
 
 
-def _install_stubs():
-    """Stub heavy dependencies so the engine module imports on CPU."""
+def _stub_modules():
+    """Build stub modules so the engine module imports on CPU.
+
+    Returned as a dict for ``mock.patch.dict(sys.modules, ...)`` so the
+    stubs only exist while importing the module under test and never leak
+    into the global ``sys.modules`` for sibling tests.
+    """
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stubs = {}
 
     def make_pkg(name, path):
         mod = types.ModuleType(name)
         mod.__path__ = [path]
-        sys.modules[name] = mod
+        stubs[name] = mod
 
     def make_mod(name, **attrs):
         mod = types.ModuleType(name)
         for key, value in attrs.items():
             setattr(mod, key, value)
-        sys.modules[name] = mod
+        stubs[name] = mod
 
     vime_dir = os.path.join(repo_root, "vime")
     make_pkg("vllm", [])
@@ -50,11 +56,11 @@ def _install_stubs():
         _wrap_ipv6=lambda host: host,
         get_host_info=lambda *a, **k: {},
     )
+    return stubs
 
 
-_install_stubs()
-
-from vime.backends.vllm_utils.vllm_engine import _wait_server_healthy  # noqa: E402
+with mock.patch.dict(sys.modules, _stub_modules()):
+    from vime.backends.vllm_utils.vllm_engine import _wait_server_healthy  # noqa: E402
 
 
 def _ok_response():
