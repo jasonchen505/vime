@@ -77,4 +77,31 @@ class WaitServerHealthyTest(unittest.TestCase):
                 probe_timeout=1.5,
             )
         get.assert_called_once_with("http://127.0.0.1:8000/health", timeout=1.5)
-# __PART2__
+    def test_unresponsive_server_does_not_block_liveness_check(self):
+        # The probe raises ConnectTimeout on every attempt while the server
+        # process dies: the loop must surface the dead process instead of
+        # hanging inside requests.get (vllm-project/vime#461).
+        alive = [True, False]
+        with (
+            mock.patch("requests.get", side_effect=requests.exceptions.ConnectTimeout("timed out")),
+            mock.patch("time.sleep"),
+        ):
+            with self.assertRaisesRegex(Exception, "Server process terminated unexpectedly"):
+                _wait_server_healthy("http://127.0.0.1:8000", is_process_alive=lambda: alive.pop(0))
+
+    def test_transient_errors_are_retried_until_success(self):
+        get = mock.Mock(
+            side_effect=[
+                requests.exceptions.ConnectionError("refused"),
+                requests.exceptions.ConnectionError("refused"),
+                _ok_response(),
+            ]
+        )
+        with mock.patch("requests.get", get), mock.patch("time.sleep"):
+            _wait_server_healthy("http://127.0.0.1:8000", is_process_alive=lambda: True)
+        self.assertEqual(get.call_count, 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
