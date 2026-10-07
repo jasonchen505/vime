@@ -1,0 +1,80 @@
+"""Unit tests for the vLLM server startup health probe.
+
+Covers ``vime.backends.vllm_utils.vllm_engine._wait_server_healthy``:
+
+* every ``/health`` probe carries a timeout, so a server that accepts the
+  connection but never responds cannot stall the startup loop forever
+  (vllm-project/vime#461);
+* a dead server process is still detected promptly via ``is_process_alive``;
+* transient connection errors are retried until the probe succeeds.
+"""
+
+import os
+import sys
+import types
+import unittest
+from unittest import mock
+
+import requests
+
+
+def _install_stubs():
+    """Stub heavy dependencies so the engine module imports on CPU."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def make_pkg(name, path):
+        mod = types.ModuleType(name)
+        mod.__path__ = [path]
+        sys.modules[name] = mod
+
+    def make_mod(name, **attrs):
+        mod = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(mod, key, value)
+        sys.modules[name] = mod
+
+    vime_dir = os.path.join(repo_root, "vime")
+    make_pkg("vllm", [])
+    make_pkg("vllm.utils", [])
+    make_mod("vllm.utils.system_utils", kill_process_tree=lambda *a, **k: None)
+    make_mod("cloudpickle")
+    make_pkg("vime", vime_dir)
+    make_pkg("vime.backends", os.path.join(vime_dir, "backends"))
+    make_pkg("vime.backends.vllm_utils", os.path.join(vime_dir, "backends", "vllm_utils"))
+    make_mod("vime.backends.vllm_utils.external", get_server_info=lambda *a, **k: {})
+    make_pkg("vime.ray", os.path.join(vime_dir, "ray"))
+    make_mod("vime.ray.ray_actor", RayActor=type("RayActor", (), {}))
+    make_pkg("vime.utils", os.path.join(vime_dir, "utils"))
+    make_mod(
+        "vime.utils.http_utils",
+        _wrap_ipv6=lambda host: host,
+        get_host_info=lambda *a, **k: {},
+    )
+
+
+_install_stubs()
+
+from vime.backends.vllm_utils.vllm_engine import _wait_server_healthy  # noqa: E402
+
+
+def _ok_response():
+    resp = mock.Mock()
+    resp.status_code = 200
+    return resp
+
+
+class WaitServerHealthyTest(unittest.TestCase):
+    def test_probe_carries_default_timeout(self):
+        with mock.patch("requests.get", return_value=_ok_response()) as get:
+            _wait_server_healthy("http://127.0.0.1:8000", is_process_alive=lambda: True)
+        get.assert_called_once_with("http://127.0.0.1:8000/health", timeout=5.0)
+
+    def test_custom_probe_timeout_is_used(self):
+        with mock.patch("requests.get", return_value=_ok_response()) as get:
+            _wait_server_healthy(
+                "http://127.0.0.1:8000",
+                is_process_alive=lambda: True,
+                probe_timeout=1.5,
+            )
+        get.assert_called_once_with("http://127.0.0.1:8000/health", timeout=1.5)
+# __PART2__
