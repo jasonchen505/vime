@@ -1,12 +1,20 @@
+from argparse import Namespace
+
 import _cp_dist_helpers  # noqa: F401
 import pytest
 import torch
 
 from megatron.core import mpu
-from vime.backends.megatron_utils.loss import _build_topp_keep_mask
+from vime.backends.megatron_utils.loss import _build_topp_keep_mask, get_rollout_top_p_logprob_kwargs
 
 
 NUM_GPUS = 0
+
+
+@pytest.mark.unit
+def test_missing_top_p_replay_data_raises():
+    with pytest.raises(ValueError, match="requires rollout_top_p_token_ids"):
+        get_rollout_top_p_logprob_kwargs(Namespace(rollout_top_p=0.95), {})
 
 
 def _set_cp(monkeypatch, *, size: int, rank: int) -> None:

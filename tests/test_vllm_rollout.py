@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import sys
 from argparse import Namespace
 from contextlib import contextmanager
@@ -66,6 +67,8 @@ class _PatchedGenerateState:
         self.aborted = False
         self.remaining_batch_size = 0
         self.pendings: set = set()
+        self.cancellable_tasks: set = set()
+        self.active_server_generations = 0
         self.dp_counts = [0]
         self.dp_rank = 0
         self.group_sampling_seeds = None
@@ -83,6 +86,8 @@ class _PatchedGenerateState:
     def reset(self) -> None:
         self.remaining_batch_size = 0
         self.pendings = set()
+        self.cancellable_tasks = set()
+        self.active_server_generations = 0
         self.aborted = False
 
 
@@ -127,18 +132,33 @@ def _default_sampling_params(**overrides) -> dict:
     return sp
 
 
-def _generate_response(token_ids: list[int] | None = None) -> dict:
+def _generate_response(
+    token_ids: list[int] | None = None,
+    weight_version: str | None = None,
+    request_spec_decode_stats: dict[str, int] | None = None,
+    sampling_mask: list[list[int]] | None = None,
+    request_metrics: dict[str, float] | None = None,
+) -> dict:
     tids = token_ids or [50, 51]
-    return {
+    response = {
         "choices": [
             {
                 "token_ids": tids,
                 "finish_reason": "stop",
-                "logprobs": {"content": [{"logprob": -0.1}, {"logprob": -0.2}]},
+                "logprobs": {"content": [{"logprob": -(index + 1) / 10} for index in range(len(tids))]},
             }
         ],
         "usage": {"prompt_tokens": 3, "completion_tokens": len(tids)},
     }
+    if weight_version is not None:
+        response["weight_version"] = weight_version
+    if request_spec_decode_stats is not None:
+        response["request_spec_decode_stats"] = request_spec_decode_stats
+    if sampling_mask is not None:
+        response["choices"][0]["sampling_mask"] = sampling_mask
+    if request_metrics is not None:
+        response["request_metrics"] = request_metrics
+    return response
 
 
 @pytest.fixture
@@ -203,10 +223,47 @@ def test_get_model_url_named_router_and_fallback():
 
 
 @pytest.mark.unit
+def test_geo3k_turn_preserves_sampling_metadata(monkeypatch):
+    from examples.geo3k_vlm_multi_turn import rollout as geo3k
+
+    monkeypatch.setattr(geo3k, "GenerateState", _PatchedGenerateState)
+    monkeypatch.setattr(
+        geo3k,
+        "post",
+        AsyncMock(
+            return_value={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "token_ids": [65],
+                        "logprobs": {"content": [{"logprob": -0.1}]},
+                        "sampling_mask": [[65, 66]],
+                    }
+                ],
+                "weight_version": "7",
+            }
+        ),
+    )
+    sample = Sample(tokens=[1])
+    rollout = geo3k._Geo3kRollout(
+        _rollout_args(max_turns=2, rollout_top_p=0.9),
+        sample,
+        {"max_new_tokens": 8, "temperature": 0.8, "top_p": 0.9},
+    )
+    turn = asyncio.run(rollout._generate_turn(rollout.inference_params))
+    rollout._append_generated(turn)
+    assert sample.rollout_top_p_token_ids.tolist() == [65, 66]
+    assert sample.rollout_top_p_token_offsets.tolist() == [0, 2]
+    assert sample.weight_versions == ["7"]
+
+
+@pytest.mark.unit
 def test_build_inference_sampling_params_maps_rollout_fields():
     sp = mod._build_inference_sampling_params(
         {
             "max_new_tokens": 16,
+            "min_new_tokens": 4,
+            "repetition_penalty": 1.2,
             "temperature": 0.7,
             "top_p": 0.9,
             "top_k": 40,
@@ -214,9 +271,12 @@ def test_build_inference_sampling_params_maps_rollout_fields():
             "stop_token_ids": [2],
             "seed": 42,
             "skip_special_tokens": False,
+            "spaces_between_special_tokens": False,
         }
     )
     assert sp["max_tokens"] == 16
+    assert sp["min_tokens"] == 4
+    assert sp["repetition_penalty"] == 1.2
     assert sp["temperature"] == 0.7
     assert sp["top_p"] == 0.9
     assert sp["top_k"] == 40
@@ -224,6 +284,7 @@ def test_build_inference_sampling_params_maps_rollout_fields():
     assert sp["stop_token_ids"] == [2]
     assert sp["seed"] == 42
     assert sp["skip_special_tokens"] is False
+    assert sp["spaces_between_special_tokens"] is False
     assert sp["logprobs"] == 1
 
 
@@ -231,6 +292,23 @@ def test_build_inference_sampling_params_maps_rollout_fields():
 def test_build_inference_sampling_params_forwards_disabled_top_k():
     sp = mod._build_inference_sampling_params({"max_new_tokens": 8, "temperature": 0.0, "top_p": 1.0, "top_k": -1})
     assert sp["top_k"] == -1
+
+
+@pytest.mark.unit
+def test_inference_generate_tokens_and_logprobs_aligns_partial_content():
+    token_ids, log_probs = mod._inference_generate_tokens_and_logprobs(
+        {
+            "token_ids": [11, 12, 13],
+            "logprobs": {"content": [{"logprob": -0.1}, {"logprob": -0.2}]},
+        }
+    )
+    assert token_ids == [11, 12, 13]
+    assert log_probs == [-0.1, -0.2, 0.0]
+
+
+@pytest.mark.unit
+def test_inference_generate_tokens_and_logprobs_rejects_invalid_token_ids():
+    assert mod._inference_generate_tokens_and_logprobs({"token_ids": [1, "2"]}) == ([], [])
 
 
 @pytest.mark.unit
@@ -311,25 +389,263 @@ def test_mm_render_response_empty_engine_prompts_raises():
 
 @pytest.mark.unit
 def test_generate_text_path_updates_sample(patch_generate_state, monkeypatch):
-    post_mock = AsyncMock(return_value=_generate_response([50, 51]))
+    post_mock = AsyncMock(
+        return_value=_generate_response(
+            [50, 51],
+            weight_version="step-7",
+            sampling_mask=[[1, 50], [2, 3, 51]],
+            request_spec_decode_stats={
+                "num_accepted_draft_tokens": 6,
+                "num_draft_tokens": 8,
+                "num_spec_steps": 2,
+            },
+            request_metrics={
+                "queue_time_ms": 100,
+                "time_to_first_token_ms": 200,
+                "generation_time_ms": 300,
+                "tokens_per_second": 20,
+                "remote_kv_wait_time_ms": 50,
+                "kv_transfer_worker_time_ms": 50,
+            },
+        )
+    )
     monkeypatch.setattr(mod, "post", post_mock)
 
     sample = Sample(index=0, prompt="abc")
     result = asyncio.run(
         mod.generate(
-            _rollout_args(),
+            _rollout_args(vllm_speculative_config={"method": "mtp"}),
             sample,
-            _default_sampling_params(max_new_tokens=8),
+            _default_sampling_params(max_new_tokens=8, min_new_tokens=2, repetition_penalty=1.2),
         )
     )
 
     assert result.tokens == [97, 98, 99, 50, 51]
     assert result.response_length == 2
     assert result.rollout_log_probs == pytest.approx([-0.1, -0.2])
+    assert result.rollout_top_p_token_ids.tolist() == [1, 50, 2, 3, 51]
+    assert result.rollout_top_p_token_offsets.tolist() == [0, 2, 5]
+    assert result.weight_versions == ["step-7"]
+    assert result.spec_info.spec_accept_token_num == 6
+    assert result.spec_info.spec_draft_token_num == 8
+    assert result.spec_info.spec_verify_ct == 2
     assert result.status == Sample.Status.COMPLETED
+    generate_span = next(
+        event for event in result.trace["events"] if event["type"] == "span_end" and event["name"] == "vllm_generate"
+    )
+    assert generate_span["attrs"] == {
+        "pd_decode_remote_kv_wait_duration": pytest.approx(0.05),
+        "pd_transfer_worker_duration": pytest.approx(0.05),
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "queue_time": pytest.approx(0.1),
+        "e2e_latency": pytest.approx(0.6),
+        "decode_throughput": pytest.approx(20),
+    }
+    assert not any(
+        event["type"] == "span_end" and event["name"] == "vllm_pd_decode_transfer" for event in result.trace["events"]
+    )
     body = post_mock.await_args_list[0].args[1]
     assert body["token_ids"] == [97, 98, 99]
     assert body["sampling_params"]["max_tokens"] == 8
+    assert body["sampling_params"]["min_tokens"] == 2
+    assert body["sampling_params"]["repetition_penalty"] == 1.2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("terminal_only", [False, True])
+def test_generate_streaming_records_weight_version(patch_generate_state, monkeypatch, terminal_only):
+    from vime.rollout import vllm_streaming_rollout as streaming
+
+    class FakeStreamResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            chunks = [
+                {
+                    "request_id": "stream-7",
+                    "weight_version": "step-7",
+                    "request_spec_decode_stats": {
+                        "num_accepted_tokens": 6,
+                        "num_draft_tokens": 8,
+                        "num_verify_steps": 2,
+                    },
+                    "choices": [
+                        {
+                            "token_ids": [50],
+                            "sampling_mask": [[1, 50]],
+                            "finish_reason": None,
+                            "logprobs": {"content": [{"logprob": -0.1}]},
+                        }
+                    ],
+                },
+                {
+                    "weight_version": "step-7",
+                    "choices": [
+                        {
+                            "token_ids": [51],
+                            "sampling_mask": [[2, 3, 51]],
+                            "finish_reason": "stop",
+                            "logprobs": {"content": [{"logprob": -0.2}]},
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                },
+                {
+                    "request_id": "stream-7",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                    "request_metrics": {"queue_time_ms": 100},
+                },
+            ]
+            if terminal_only:
+                chunks[1]["choices"][0]["finish_reason"] = None
+                chunks.insert(2, {"choices": [{"token_ids": [], "finish_reason": "stop"}]})
+            for chunk in chunks:
+                yield f"data: {json.dumps(chunk)}"
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(streaming, "GenerateState", _PatchedGenerateState)
+    monkeypatch.setattr(streaming.http_utils, "_http_client", FakeClient())
+
+    result = asyncio.run(
+        streaming.generate_streaming(
+            _rollout_args(vllm_speculative_config={"method": "mtp"}),
+            Sample(index=0, prompt="abc"),
+            _default_sampling_params(max_new_tokens=8),
+        )
+    )
+
+    assert result.tokens == [97, 98, 99, 50, 51]
+    assert result.rollout_log_probs == pytest.approx([-0.1, -0.2])
+    assert result.rollout_top_p_token_ids.tolist() == [1, 50, 2, 3, 51]
+    assert result.rollout_top_p_token_offsets.tolist() == [0, 2, 5]
+    assert result.weight_versions == ["step-7"]
+    assert result.spec_info.spec_accept_token_num == 6
+    assert result.spec_info.spec_draft_token_num == 8
+    assert result.spec_info.spec_verify_ct == 2
+    assert result.status == Sample.Status.COMPLETED
+
+    event = next(
+        event
+        for event in result.trace["events"]
+        if event["type"] == "span_end" and event["name"] == "vllm_inference_generate_stream"
+    )
+    assert event["attrs"]["vllm_request_id"] == "stream-7"
+    assert event["attrs"]["finish_reason"] == "stop"
+    assert event["attrs"]["completion_tokens"] == 2
+    assert event["attrs"]["queue_time"] == pytest.approx(0.1)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stream_interval", [1, 20, 64])
+def test_generate_streaming_preserves_metadata_across_stream_intervals(
+    patch_generate_state, monkeypatch, stream_interval
+):
+    from vime.rollout import vllm_streaming_rollout as streaming
+
+    response_tokens = list(range(11, 76))
+
+    class FakeStreamResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for start in range(0, len(response_tokens), stream_interval):
+                tokens = response_tokens[start : start + stream_interval]
+                chunk = _generate_response(tokens, sampling_mask=[[token + 1000] for token in tokens])
+                chunk["choices"][0]["logprobs"]["content"] = [{"logprob": -float(token)} for token in tokens]
+                chunk["choices"][0]["finish_reason"] = None
+                yield f"data: {json.dumps(chunk)}"
+            yield 'data: {"choices": [{"token_ids": [], "finish_reason": "stop"}]}'
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(streaming, "GenerateState", _PatchedGenerateState)
+    monkeypatch.setattr(streaming.http_utils, "_http_client", FakeClient())
+    result = asyncio.run(
+        streaming.generate_streaming(
+            _rollout_args(), Sample(prompt="abc"), _default_sampling_params(max_new_tokens=len(response_tokens))
+        )
+    )
+    assert result.status == Sample.Status.COMPLETED
+    assert result.tokens == [97, 98, 99, *response_tokens]
+    assert result.response_length == len(response_tokens)
+    assert result.rollout_log_probs == [-float(token) for token in response_tokens]
+    assert result.rollout_top_p_token_ids.tolist() == [token + 1000 for token in response_tokens]
+    assert result.rollout_top_p_token_offsets.tolist() == list(range(len(response_tokens) + 1))
+
+
+@pytest.mark.unit
+def test_generate_streaming_stops_at_partial_token_budget(patch_generate_state, monkeypatch):
+    from vime.rollout import vllm_streaming_rollout as streaming
+
+    monkeypatch.setattr(streaming, "GenerateState", _PatchedGenerateState)
+    monkeypatch.setattr(streaming.http_utils, "_http_client", None)
+    sample = Sample(index=0, prompt="abc", tokens=[97, 98, 99, 0], response_length=1)
+    sample.status = Sample.Status.ABORTED
+    result = asyncio.run(
+        streaming.generate_streaming(_rollout_args(), sample, _default_sampling_params(max_new_tokens=1))
+    )
+    assert result.status == Sample.Status.TRUNCATED
+    assert result.tokens == [97, 98, 99, 0]
+
+
+@pytest.mark.unit
+def test_generate_streaming_rejects_unexpected_eof(patch_generate_state, monkeypatch):
+    from vime.rollout import vllm_streaming_rollout as streaming
+
+    class FakeStreamResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"choices": [{"token_ids": [50], "finish_reason": null}]}'
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(streaming, "GenerateState", _PatchedGenerateState)
+    monkeypatch.setattr(streaming.http_utils, "_http_client", FakeClient())
+
+    with pytest.raises(RuntimeError, match="without a terminal finish_reason"):
+        asyncio.run(
+            streaming.generate_streaming(
+                _rollout_args(),
+                Sample(index=0, prompt="abc"),
+                _default_sampling_params(max_new_tokens=8),
+            )
+        )
 
 
 @pytest.mark.unit
@@ -361,13 +677,22 @@ def test_generate_multimodal_render_then_generate(patch_generate_state, monkeypa
         return gen_resp
 
     monkeypatch.setattr(mod, "post", fake_post)
-    monkeypatch.setattr(mod, "encode_image_for_rollout_engine", lambda _img: "data:image/png;base64,xx")
+    monkeypatch.setattr(mod, "build_multimodal_messages", lambda *_args: [{"role": "user", "content": []}])
 
     sample = Sample(index=0, prompt="look", multimodal_inputs={"images": ["img.png"]})
     result = asyncio.run(mod.generate(_rollout_args(), sample, _default_sampling_params()))
 
     assert result.response_length == 1
     assert result.tokens[-1] == 13
+
+
+@pytest.mark.unit
+def test_build_multimodal_messages_supports_audio_and_video():
+    messages = mod.build_multimodal_messages(
+        "describe",
+        {"audio": ["https://example.com/audio.wav"], "videos": ["https://example.com/video.mp4"]},
+    )
+    assert [item["type"] for item in messages[0]["content"]] == ["text", "audio_url", "video_url"]
 
 
 @pytest.mark.unit
@@ -500,6 +825,98 @@ def test_generate_and_rm_custom_generate_path(patch_generate_state, monkeypatch)
 
 
 @pytest.mark.unit
+def test_generate_and_rm_rejects_batched_rm_length_mismatch_without_partial_assignment(
+    patch_generate_state, monkeypatch
+):
+    from vime.rollout import rm_hub
+
+    generated_samples: list[Sample] = []
+
+    async def fake_generate(args, sample, sampling_params):
+        sample.response = "a"
+        sample.response_length = 1
+        sample.tokens = [1]
+        sample.reward = None
+        sample.status = Sample.Status.COMPLETED
+
+        sibling = Sample(index=1, prompt="p1", status=Sample.Status.COMPLETED)
+        sibling.response = "b"
+        sibling.response_length = 1
+        sibling.tokens = [2]
+        sibling.reward = None
+        generated_samples[:] = [sample, sibling]
+        return generated_samples
+
+    async def short_batched_rm(args, samples, **kwargs):
+        assert len(samples) == 2
+        return [0.25]
+
+    monkeypatch.setattr(mod, "generate", fake_generate)
+    monkeypatch.setattr(rm_hub, "load_function", lambda _path: short_batched_rm)
+
+    with pytest.raises(ValueError, match="returned 1 rewards for 2 samples"):
+        asyncio.run(
+            mod.generate_and_rm(
+                _rollout_args(custom_rm_path="fake.rm"),
+                Sample(index=0, prompt="p0"),
+                _default_sampling_params(),
+            )
+        )
+
+    assert [sample.reward for sample in generated_samples] == [None, None]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "invalid_rewards,type_name",
+    [
+        ({"first": 0.25, "second": 0.75}, "dict"),
+        ("ab", "str"),
+        (b"ab", "bytes"),
+    ],
+)
+def test_generate_and_rm_rejects_deceptive_batched_rm_result_types_without_partial_assignment(
+    patch_generate_state, monkeypatch, invalid_rewards, type_name
+):
+    from vime.rollout import rm_hub
+
+    generated_samples: list[Sample] = []
+
+    async def fake_generate(args, sample, sampling_params):
+        sample.response = "a"
+        sample.response_length = 1
+        sample.tokens = [1]
+        sample.reward = None
+        sample.status = Sample.Status.COMPLETED
+
+        sibling = Sample(index=1, prompt="p1", status=Sample.Status.COMPLETED)
+        sibling.response = "b"
+        sibling.response_length = 1
+        sibling.tokens = [2]
+        sibling.reward = None
+        generated_samples[:] = [sample, sibling]
+        return generated_samples
+
+    async def invalid_batched_rm(args, samples, **kwargs):
+        assert len(samples) == 2
+        return invalid_rewards
+
+    monkeypatch.setattr(mod, "generate", fake_generate)
+    monkeypatch.setattr(rm_hub, "load_function", lambda _path: invalid_batched_rm)
+
+    with pytest.raises(TypeError, match=f"returned {type_name} instead of an iterable of rewards"):
+        asyncio.run(
+            mod.generate_and_rm(
+                _rollout_args(custom_rm_path="fake.rm"),
+                Sample(index=0, prompt="p0"),
+                _default_sampling_params(),
+            )
+        )
+
+    assert [sample.reward for sample in generated_samples] == [None, None]
+
+
+@pytest.mark.unit
 def test_generate_and_rm_group_assigns_session_ids(patch_generate_state, monkeypatch):
     async def fake_generate_and_rm(args, sample, sampling_params, evaluation=False):
         sample.response = "ok"
@@ -512,6 +929,40 @@ def test_generate_and_rm_group_assigns_session_ids(patch_generate_state, monkeyp
     result = asyncio.run(mod.generate_and_rm_group(_rollout_args(), group, _default_sampling_params()))
     assert all(s.session_id for s in result)
     assert result[0].session_id != result[1].session_id
+
+
+@pytest.mark.unit
+def test_generate_and_rm_group_rejects_batched_rm_length_mismatch_without_partial_assignment(
+    patch_generate_state, monkeypatch
+):
+    from vime.rollout import rm_hub
+
+    async def fake_generate(args, sample, sampling_params):
+        sample.response = "ok"
+        sample.response_length = 1
+        sample.tokens = [sample.index or 0]
+        sample.reward = None
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    async def long_batched_rm(args, samples, **kwargs):
+        assert len(samples) == 2
+        return [0.25, 0.75, 1.0]
+
+    monkeypatch.setattr(mod, "generate", fake_generate)
+    monkeypatch.setattr(rm_hub, "load_function", lambda _path: long_batched_rm)
+
+    group = [Sample(index=0, prompt="p0"), Sample(index=1, prompt="p1")]
+    with pytest.raises(ValueError, match="returned 3 rewards for 2 samples"):
+        asyncio.run(
+            mod.generate_and_rm_group(
+                _rollout_args(group_rm=True, custom_rm_path="fake.rm"),
+                group,
+                _default_sampling_params(),
+            )
+        )
+
+    assert [sample.reward for sample in group] == [None, None]
 
 
 @pytest.mark.unit
@@ -531,7 +982,12 @@ def test_eval_rollout_passk_requests_do_not_share_session_ids(patch_generate_sta
 
     args = _rollout_args()
     dataset_cfg = EvalDatasetConfig(name="eval", path="/tmp/eval.jsonl", n_samples_per_eval_prompt=2)
-    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
+    cache_key = dataset_cfg.cache_key + (
+        args.hf_checkpoint,
+        args.apply_chat_template,
+        None,
+        None,
+    )
     mod.EVAL_PROMPT_DATASET[cache_key] = type("DummyDataset", (), {"samples": [Sample(prompt="prompt")]})()
 
     result = asyncio.run(mod.eval_rollout_single_dataset(args, rollout_id=0, dataset_cfg=dataset_cfg))
@@ -547,6 +1003,7 @@ def test_abort_deletes_inflight_without_pause_resume(patch_generate_state, monke
     from vime.backends.vllm_utils import server_control
 
     state = _PatchedGenerateState(_rollout_args())
+    state.active_server_generations = 1
     monkeypatch.setattr(mod, "GenerateState", lambda args: state)
 
     aborted = asyncio.Event()
@@ -592,6 +1049,7 @@ def test_abort_collects_partial_samples_when_partial_rollout(patch_generate_stat
 
     args = _rollout_args(partial_rollout=True)
     state = _PatchedGenerateState(args)
+    state.active_server_generations = 1
     monkeypatch.setattr(mod, "GenerateState", lambda a: state)
 
     aborted = asyncio.Event()
@@ -609,9 +1067,11 @@ def test_abort_collects_partial_samples_when_partial_rollout(patch_generate_stat
 
     sample = Sample(index=0, prompt="p")
     sample.response = "partial"
+    sample.response_length = 1
 
     async def pending_group():
         await aborted.wait()
+        sample.status = Sample.Status.ABORTED
         return [sample]
 
     async def run_abort():
@@ -622,6 +1082,248 @@ def test_abort_collects_partial_samples_when_partial_rollout(patch_generate_stat
 
     assert aborted_samples == [[sample]]
     assert sample.metadata["start_rollout_id"] == 7
+
+
+@pytest.mark.unit
+def test_abort_cancels_request_without_server_abort(patch_generate_state, monkeypatch):
+    args = _rollout_args(partial_rollout=True)
+    state = _PatchedGenerateState(args)
+    monkeypatch.setattr(mod, "GenerateState", lambda a: state)
+    get_mock = AsyncMock()
+    monkeypatch.setattr(mod, "get", get_mock)
+
+    sample = Sample(index=0, prompt="p")
+    sample.response = "partial"
+    sample.response_length = 1
+
+    async def request():
+        await asyncio.Future()
+
+    async def run():
+        generate_task = asyncio.create_task(mod._run_request_abortable_generate(state, sample, request()))
+        await asyncio.sleep(0)
+
+        async def group():
+            return [await generate_task]
+
+        state.pendings = {asyncio.create_task(group())}
+        return await asyncio.wait_for(mod.abort(args, rollout_id=9), timeout=5.0)
+
+    assert asyncio.run(run()) == [[sample]]
+    assert sample.status == Sample.Status.ABORTED
+    assert sample.metadata["start_rollout_id"] == 9
+    get_mock.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("unrelated_cancel", [False, True])
+def test_stream_cancellation_closes_http_and_preserves_prefix(patch_generate_state, monkeypatch, unrelated_cancel):
+    from vime.rollout import vllm_streaming_rollout as streaming
+
+    args = _rollout_args()
+    state = _PatchedGenerateState(args)
+    monkeypatch.setattr(mod, "GenerateState", lambda args: state)
+    monkeypatch.setattr(streaming, "GenerateState", lambda args: state)
+    monkeypatch.setattr(mod, "load_function", lambda path: streaming.generate_streaming)
+    prefix_seen = asyncio.Event()
+    request_closed = asyncio.Event()
+    server_started = asyncio.Event()
+    server_released = asyncio.Event()
+
+    class FakeResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            request_closed.set()
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            chunk = _generate_response([120], sampling_mask=[[12, 120]])
+            chunk["choices"][0]["finish_reason"] = None
+            yield f"data: {json.dumps(chunk)}"
+            prefix_seen.set()
+            await asyncio.Future()
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeResponse()
+
+    async def server_generate(args, sample, sampling_params):
+        server_started.set()
+        await server_released.wait()
+        sample.status = Sample.Status.ABORTED
+        return sample
+
+    async def abort_servers(urls):
+        assert urls == ["http://worker:9000"]
+        server_released.set()
+
+    monkeypatch.setattr(streaming.http_utils, "_http_client", FakeClient())
+    monkeypatch.setattr(mod, "generate", server_generate)
+    get_mock = AsyncMock(return_value={"workers": [{"url": "http://worker:9000"}]})
+    monkeypatch.setattr(mod, "get", get_mock)
+    monkeypatch.setattr(mod, "abort_inflight_requests", abort_servers)
+    sample = Sample(prompt="abc", generate_function_path="streaming")
+
+    async def exercise():
+        request_task = asyncio.create_task(mod.generate_and_rm(args, sample, _default_sampling_params()))
+        await prefix_seen.wait()
+        if unrelated_cancel:
+            state.aborted = True
+            request_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+            get_mock.assert_not_awaited()
+        else:
+            server_task = asyncio.create_task(mod.generate_and_rm(args, Sample(prompt="abc"), {}))
+            await server_started.wait()
+            await mod.abort(args, rollout_id=7)
+            result, server_result = await asyncio.gather(request_task, server_task)
+            assert result is sample
+            assert result.status == server_result.status == Sample.Status.ABORTED
+            get_mock.assert_awaited_once()
+
+    async def run():
+        await asyncio.wait_for(exercise(), timeout=5)
+
+    asyncio.run(run())
+    assert request_closed.is_set()
+    assert sample.tokens == [97, 98, 99, 120]
+    assert sample.response == "x"
+    assert sample.response_length == 1
+    assert sample.rollout_log_probs == [-0.1]
+    assert sample.rollout_top_p_token_ids.tolist() == [12, 120]
+    assert sample.rollout_top_p_token_offsets.tolist() == [0, 2]
+    assert not state.cancellable_tasks
+    assert state.active_server_generations == 0
+
+
+@pytest.mark.unit
+def test_partial_abort_resumes_only_aborted_siblings(patch_generate_state, monkeypatch):
+    from vime.rollout import vllm_streaming_rollout as streaming
+
+    args = _rollout_args(
+        partial_rollout=True,
+        mask_offpolicy_in_partial_rollout=True,
+        custom_generate_function_path="streaming",
+    )
+    state = _PatchedGenerateState(args)
+    monkeypatch.setattr(mod, "GenerateState", lambda args: state)
+    monkeypatch.setattr(streaming, "GenerateState", lambda args: state)
+    monkeypatch.setattr(mod, "load_function", lambda path: streaming.generate_streaming)
+    partial = Sample(
+        prompt="abc",
+        tokens=[97, 98, 99, 120],
+        response="x",
+        response_length=1,
+        rollout_log_probs=[-0.1],
+        loss_mask=[1],
+        status=Sample.Status.ABORTED,
+    )
+    terminal = Sample(
+        prompt="abc",
+        tokens=[97, 98, 99, 122],
+        response="z",
+        response_length=1,
+        rollout_log_probs=[-0.3],
+        reward=1.0,
+        status=Sample.Status.COMPLETED,
+    )
+    empty = Sample(status=Sample.Status.ABORTED)
+    mixed_group = [terminal, partial]
+    payloads = []
+
+    class FakeResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            yield f"data: {json.dumps(_generate_response([121]))}"
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def stream(self, method, url, *, json, headers):
+            payloads.append(json)
+            return FakeResponse()
+
+    monkeypatch.setattr(streaming.http_utils, "_http_client", FakeClient())
+    reward = AsyncMock(return_value=2.0)
+    monkeypatch.setattr(mod, "async_rm", reward)
+
+    async def exercise():
+        state.pendings = {
+            asyncio.create_task(asyncio.sleep(0, result=group)) for group in (mixed_group, [terminal], [empty])
+        }
+        buffered = await mod.abort(args, rollout_id=7)
+        assert buffered == [mixed_group]
+        assert not state.pendings
+        state.aborted = False
+        return await mod.generate_and_rm_group(args, buffered[0], _default_sampling_params(max_new_tokens=8))
+
+    async def run():
+        return await asyncio.wait_for(exercise(), timeout=5)
+
+    assert asyncio.run(run()) == mixed_group
+    assert len(payloads) == 1
+    assert payloads[0]["token_ids"] == [97, 98, 99, 120]
+    assert payloads[0]["sampling_params"]["max_tokens"] == 7
+    assert partial.tokens == [97, 98, 99, 120, 121]
+    assert partial.response == "xy"
+    assert partial.response_length == 2
+    assert partial.rollout_log_probs == [-0.1, -0.1]
+    assert partial.loss_mask == [0, 1]
+    assert partial.status == terminal.status == Sample.Status.COMPLETED
+    assert partial.reward == 2.0
+    assert terminal.tokens == [97, 98, 99, 122]
+    assert terminal.response == "z"
+    assert terminal.reward == 1.0
+    assert partial.metadata["start_rollout_id"] == terminal.metadata["start_rollout_id"] == 7
+    reward.assert_awaited_once_with(args, partial)
+
+
+@pytest.mark.unit
+def test_multi_agent_generate_response_preserves_request_metadata(monkeypatch):
+    from examples.multi_agent import agent_system
+
+    class CallableTokenizer(_FakeTokenizer):
+        def __call__(self, prompt, add_special_tokens=False):
+            return {"input_ids": self.encode(prompt, add_special_tokens=add_special_tokens)}
+
+    args = _rollout_args(
+        tokenizer=CallableTokenizer(),
+        sampling_params=_default_sampling_params(),
+        rollout_max_context_len=32,
+        sample=Sample(),
+        results_dict={"solver": []},
+        vllm_speculative_config={"method": "mtp"},
+    )
+    post_mock = AsyncMock(
+        return_value=_generate_response(
+            weight_version="step-7",
+            request_spec_decode_stats={"num_accepted_tokens": 6, "num_draft_tokens": 8, "num_verify_steps": 2},
+        )
+    )
+    monkeypatch.setattr(agent_system, "post", post_mock)
+
+    asyncio.run(agent_system.generate_response(args, "abc", "solver"))
+
+    post_mock.assert_awaited_once()
+    assert len(args.results_dict["solver"]) == 1
+    sample = args.results_dict["solver"][0]
+    assert sample.weight_versions == ["step-7"]
+    assert sample.spec_info.spec_accept_token_num == 6
+    assert sample.spec_info.spec_draft_token_num == 8
+    assert sample.spec_info.spec_verify_ct == 2
 
 
 if __name__ == "__main__":

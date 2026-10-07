@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from vime.ray.rollout import _compute_top_p_kept_vocab_metrics
+from vime.observability.rollout_metrics import _compute_spec_metrics, _compute_top_p_kept_vocab_metrics
 from vime.utils.misc import decode_int32_meta_array
 from vime.utils.types import Sample
 
@@ -13,7 +13,20 @@ NUM_GPUS = 0
 
 
 def _make_args():
-    return Namespace(vllm_speculative_algorithm=False, num_layers=2, moe_router_topk=2)
+    return Namespace(vllm_speculative_config=None, num_layers=2, moe_router_topk=2)
+
+
+@pytest.mark.unit
+def test_spec_metrics_use_vllm_speculative_config():
+    sample = Sample()
+    sample.spec_info.spec_accept_token_num = 6
+    sample.spec_info.spec_draft_token_num = 8
+    sample.spec_info.spec_verify_ct = 2
+    args = Namespace(vllm_speculative_config={"method": "mtp", "num_speculative_tokens": 4})
+    metrics = _compute_spec_metrics(args, [sample])
+    assert metrics["spec_accept_rate"] == sample.spec_info.spec_accept_rate
+    assert metrics["spec_accept_length"] == sample.spec_info.spec_accept_length
+    assert _compute_spec_metrics(_make_args(), [sample]) == {}
 
 
 @pytest.mark.unit
@@ -31,7 +44,7 @@ def test_top_p_kept_vocab_metric_uses_loss_mask():
         ),
     ]
 
-    metrics = _compute_top_p_kept_vocab_metrics(None, samples)
+    metrics = _compute_top_p_kept_vocab_metrics(samples)
 
     assert metrics["top_p_kept_vocab_per_token"] == pytest.approx(3.5)
 
@@ -47,7 +60,7 @@ def test_top_p_kept_vocab_metric_skips_removed_samples():
         )
     ]
 
-    assert _compute_top_p_kept_vocab_metrics(None, samples) == {}
+    assert _compute_top_p_kept_vocab_metrics(samples) == {}
 
 
 def _b64_int32(values: list[int]) -> str:
@@ -147,6 +160,40 @@ def test_append_response_tokens_decodes_routed_experts():
 
 
 @pytest.mark.unit
+def test_append_response_tokens_ignores_split_pd_routed_experts():
+    sample = Sample(tokens=[101, 102, 103, 104])
+
+    sample.append_response_tokens(
+        _make_args(),
+        tokens=[],
+        trainable=True,
+        meta_info={
+            "pd_prefill_routed_experts": _b64_int32([0, 1, 2, 3, 4, 5, 6, 7]),
+            "pd_decode_routed_experts": _b64_int32([8, 9, 10, 11]),
+            "finish_reason": {"type": "stop"},
+        },
+    )
+
+    assert sample.rollout_routed_experts is None
+
+
+@pytest.mark.unit
+def test_append_response_tokens_rejects_mismatched_routed_experts_shape():
+    sample = Sample(tokens=[101, 102, 103])
+
+    with pytest.raises(ValueError, match="routed_experts element count"):
+        sample.append_response_tokens(
+            _make_args(),
+            tokens=[],
+            trainable=True,
+            meta_info={
+                "routed_experts": _b64_int32([0, 1, 2, 3]),
+                "finish_reason": {"type": "stop"},
+            },
+        )
+
+
+@pytest.mark.unit
 def test_append_response_tokens_pads_top_p_for_non_trainable_tokens():
     sample = Sample(
         tokens=[0, 1],
@@ -181,3 +228,7 @@ def test_append_response_tokens_rejects_non_trainable_log_probs():
 
     with pytest.raises(ValueError, match="non-trainable response tokens should not pass rollout log probabilities"):
         sample.append_response_tokens(tokens=[10], log_probs=[-0.1], trainable=False)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

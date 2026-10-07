@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -124,114 +124,6 @@ def get_sum_of_sample_mean(
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
 
 
-def reduce_train_step_metrics(
-    losses_reduced: list[dict],
-    *,
-    calculate_per_token_loss: bool,
-    step_global_batch_size: int,
-    cp_size: int,
-    dp_with_cp_group,
-) -> dict[str, float]:
-    """Aggregate per-mb log dicts into the dict ``train_one_step`` reports.
-
-    Pipeline (1:1 with what the train loop used to do inline):
-      1. Sum each metric's per-mb ``values`` tensor locally on this rank.
-      2. All-reduce across the DP*CP group (``dp_with_cp_group``).
-      3. Apply the per-mode divisor / cp_factor:
-         - per-token-loss: divisor = ``values[0]`` = all-reduced ``num_tokens``,
-           CP-inflated by ``cp_size`` because every CP rank computes the same
-           num_tokens off the FULL (not chunked) masks; the
-           ``cp_factor = cp_size`` multiplier cancels that inflation, leaving
-           the genuine per-token average.
-         - per-rollout-mean: divisor = constant ``step_global_batch_size`` from
-           the rollout side, never all-reduced, so no CP inflation to cancel
-           and ``cp_factor = 1``.
-
-    Tests pass a mock ``dp_with_cp_group`` and monkeypatch ``dist.all_reduce``
-    to a no-op, then pre-aggregate virtual ranks themselves — this exercises
-    the same call shape as production while staying single-process.
-    """
-    keys = losses_reduced[0]["keys"]
-    values = None
-    for x in losses_reduced:
-        values = x["values"] if values is None else values + x["values"]
-    assert len(keys) + 1 == values.numel()
-    dist.all_reduce(values, group=dp_with_cp_group)
-    values = values.tolist()
-
-    if calculate_per_token_loss:
-        num_samples_or_tokens = values[0]
-        cp_factor = cp_size
-    else:
-        num_samples_or_tokens = step_global_batch_size
-        cp_factor = 1
-    return {key: value * cp_factor / num_samples_or_tokens for key, value in zip(keys, values[1:], strict=False)}
-
-
-def rollout_log_metric_contribution(
-    per_rank_reducer_sum: float,
-    *,
-    cp_size: int,
-    num_rollouts_in_rollout: int,
-    dp_size: int,
-) -> tuple[float, float]:
-    """``(sum, count)`` tuple to hand the gather step for a per-rollout-mean
-    metric on the rollout side (``log_rollout_data``).
-
-    Sum across DP*CP ranks of ``count`` lands on ``num_rollouts_in_rollout``
-    (``dp_size`` here is the no-CP DP width; the gather covers ``dp_size *
-    cp_size`` ranks, and each rank emits the same ``count``, so the totals
-    cancel out the ``cp_size`` in the sum). Result: ``Σsum / Σcount =
-    sum_DP_full / num_rollouts`` — the same number ``train_one_step`` reports
-    for the same samples (when ``num_steps_per_rollout == 1``).
-
-    Pair with :func:`gather_and_reduce_log_dict` to do the full end-to-end
-    in tests (single helper call per rank, returns the reduced number on
-    the source rank).
-    """
-    sum_value = cp_size * per_rank_reducer_sum
-    count = num_rollouts_in_rollout / dp_size
-    return sum_value, count
-
-
-def gather_and_reduce_log_dict(
-    log_dict: dict,
-    *,
-    dp_size: int,
-    dp_src_rank: int,
-    dp_group,
-) -> dict | None:
-    """``dist.gather_object`` per-rank log_dicts + per-key reduction.
-
-    Per key in the gathered dicts:
-      - ``(sum, count)`` tuple → ``Σsum / Σcount`` (per-rollout-mean shape;
-        pair with :func:`rollout_log_metric_contribution`).
-      - plain value → ``Σ / dp_size`` (legacy mean-across-ranks; the only
-        correct answer when ranks hold the same data).
-
-    Returns the reduced dict on ``dp_src_rank``, ``None`` elsewhere. The
-    caller adds whatever metric-name prefix / wandb plumbing it wants —
-    this helper stays free of side effects so CPU multi-process unit tests
-    can drive it directly with real ``torch.distributed``.
-    """
-    if dist.get_rank() == dp_src_rank:
-        gathered = [None] * dp_size
-        dist.gather_object(log_dict, gathered, dst=dp_src_rank, group=dp_group)
-        reduced: dict = {}
-        for key in log_dict:
-            values = [d[key] for d in gathered]
-            first = values[0]
-            if isinstance(first, tuple) and len(first) == 2:
-                total_sum = sum(v[0] for v in values)
-                total_count = sum(v[1] for v in values)
-                reduced[key] = total_sum / total_count if total_count else 0.0
-            else:
-                reduced[key] = sum(values) / dp_size
-        return reduced
-    dist.gather_object(log_dict, None, dst=dp_src_rank, group=dp_group)
-    return None
-
-
 def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
     """
     Gather tensors across all ranks in the context parallel group.
@@ -342,3 +234,64 @@ def slice_log_prob_with_cp(
         return chunk_1 + chunk_2
     else:
         return torch.cat([chunk_1, chunk_2], dim=0)
+
+
+def _pad_routed_experts(experts: torch.Tensor, pad: int, num_experts: int) -> torch.Tensor:
+    if pad == 0:
+        return experts
+    _, num_layers, topk = experts.shape
+    pad_experts = (
+        torch.arange(
+            pad * num_layers * topk,
+            device=experts.device,
+            dtype=experts.dtype,
+        ).reshape((pad, num_layers, topk))
+        % num_experts
+    )
+    return torch.cat([experts, pad_experts], dim=0)
+
+
+def prepare_routed_experts_for_routing_replay(
+    rollout_routed_experts: Sequence[torch.Tensor],
+    tokens: Sequence[torch.Tensor],
+    *,
+    num_experts: int,
+    data_pad_size_multiplier: int,
+    sequence_parallel: bool,
+    allgather_cp: bool,
+) -> torch.Tensor:
+    """Align rollout routed-experts metadata with the training token layout."""
+    assert len(rollout_routed_experts) == len(tokens)
+    for experts, token_ids in zip(rollout_routed_experts, tokens, strict=False):
+        assert experts.shape[0] == token_ids.shape[0] - 1, f"{experts.shape}, {token_ids.shape}"
+
+    padded_experts = [_pad_routed_experts(experts, 1, num_experts) for experts in rollout_routed_experts]
+    pad_size = mpu.get_tensor_model_parallel_world_size() * data_pad_size_multiplier
+
+    if allgather_cp:
+        routed_experts = torch.cat(padded_experts, dim=0)
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        global_pad_size = cp_size * pad_size
+        pad = (global_pad_size - routed_experts.size(0) % global_pad_size) % global_pad_size
+        routed_experts = _pad_routed_experts(routed_experts, pad, num_experts)
+        routed_experts = routed_experts.chunk(cp_size, dim=0)[cp_rank]
+    else:
+        routed_experts = [
+            slice_with_cp(experts, lambda x, pad: _pad_routed_experts(x, pad, num_experts))
+            for experts in padded_experts
+        ]
+        routed_experts = torch.cat(routed_experts, dim=0)
+        pad = (pad_size - routed_experts.size(0) % pad_size) % pad_size
+        routed_experts = _pad_routed_experts(routed_experts, pad, num_experts)
+
+    if sequence_parallel:
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        seqlen = routed_experts.size(0)
+        assert seqlen % tp_size == 0
+        start = seqlen // tp_size * tp_rank
+        end = seqlen // tp_size * (tp_rank + 1)
+        routed_experts = routed_experts[start:end]
+
+    return routed_experts

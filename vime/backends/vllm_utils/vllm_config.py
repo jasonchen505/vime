@@ -29,12 +29,9 @@ class ServerGroupConfig:
                    ``AsyncEngineArgs`` / ``FrontendArgs`` field names in
                    underscore style (e.g. ``gpu_memory_utilization``); the
                    exact accepted set is ``_vllm_server_field_names()`` in
-                   ``vllm_engine``. This is the vLLM analog of slime's sglang
-                   ``ServerArgs`` overrides — sglang exposes one ``ServerArgs``
-                   config class, whereas vLLM splits engine config
-                   (``AsyncEngineArgs``) from OpenAI-frontend config
-                   (``FrontendArgs``); their union is the faithful translation.
-                   vLLM has no class literally named ``ServerArgs``.
+                   ``vllm_engine``. The accepted set combines engine config
+                   (``AsyncEngineArgs``) and OpenAI-frontend config
+                   (``FrontendArgs``).
     """
 
     worker_type: str
@@ -150,10 +147,9 @@ class VllmConfig:
 
     Each model gets its own router.  ``placeholder`` groups reserve GPU
     slots without creating engines.  ``overrides`` are vLLM
-    ``AsyncEngineArgs`` / ``FrontendArgs`` field names (the vLLM equivalent of
-    slime's sglang ``ServerArgs``; see ``ServerGroupConfig.overrides`` and
-    ``vllm_engine._vllm_server_field_names``) applied on top of the base
-    ``--vllm-*`` CLI args.
+    ``AsyncEngineArgs`` / ``FrontendArgs`` field names (see
+    ``ServerGroupConfig.overrides`` and ``vllm_engine._vllm_server_field_names``)
+    applied on top of the base ``--vllm-*`` CLI args.
 
     Set ``update_weights: false`` for frozen models (reference, reward,
     etc.) that should not receive weight updates from training.
@@ -217,3 +213,28 @@ class VllmConfig:
     @property
     def total_num_gpus(self) -> int:
         return sum(m.total_num_gpus for m in self.models)
+
+
+def resolve_vllm_config(args) -> VllmConfig:
+    """Resolve the configured, legacy PD, or default vLLM deployment."""
+    if getattr(args, "vllm_config", None) is not None:
+        config = VllmConfig.from_yaml(args.vllm_config)
+        expected = args.rollout_num_gpus
+        actual = config.total_num_gpus
+        assert actual == expected, f"vllm_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
+        return config
+
+    if args.rollout_num_gpus == 0:
+        return VllmConfig(models=[ModelConfig(name="default", server_groups=[])])
+
+    if args.prefill_num_servers is not None:
+        return VllmConfig.from_prefill_num_servers(args)
+
+    return VllmConfig(
+        models=[
+            ModelConfig(
+                name="default",
+                server_groups=[ServerGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
+            )
+        ]
+    )

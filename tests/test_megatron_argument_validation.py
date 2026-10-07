@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import sys
 import types
@@ -43,7 +44,7 @@ def load_vime_arguments_module(monkeypatch):
     router_launch_mod = types.ModuleType("vllm_router.launch_router")
     vllm_arguments_mod = types.ModuleType("vime.backends.vllm_utils.arguments")
     vllm_external_mod = types.ModuleType("vime.backends.vllm_utils.external")
-    logging_utils_mod = types.ModuleType("vime.utils.logging_utils")
+    logging_utils_mod = types.ModuleType("vime.observability.logging_utils")
 
     router_launch_mod.RouterArgs = object
     vllm_arguments_mod.vllm_parse_args = lambda *args, **kwargs: None
@@ -55,7 +56,7 @@ def load_vime_arguments_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_router.launch_router", router_launch_mod)
     monkeypatch.setitem(sys.modules, "vime.backends.vllm_utils.arguments", vllm_arguments_mod)
     monkeypatch.setitem(sys.modules, "vime.backends.vllm_utils.external", vllm_external_mod)
-    monkeypatch.setitem(sys.modules, "vime.utils.logging_utils", logging_utils_mod)
+    monkeypatch.setitem(sys.modules, "vime.observability.logging_utils", logging_utils_mod)
 
     module_path = Path(__file__).resolve().parents[1] / "vime" / "utils" / "arguments.py"
     module_name = "test_vime_argument_validation_module"
@@ -170,58 +171,10 @@ def test_allgather_cp_ignores_cp_size_one(monkeypatch):
 @pytest.mark.unit
 def test_update_weight_disk_dir_required_for_disk_transport(monkeypatch):
     module = load_vime_arguments_module(monkeypatch)
-    args = types.SimpleNamespace(
-        update_weight_transport="disk",
-        update_weight_disk_dir=None,
-        update_weight_delta_dir=None,
-    )
+    args = make_vime_validate_args(update_weight_transport="disk", update_weight_disk_dir=None)
 
     with pytest.raises(ValueError, match="update-weight-disk-dir"):
-        module._resolve_update_weight_disk_dir(args)
-
-
-@pytest.mark.unit
-def test_update_weight_disk_dir_normalizes_delta_alias(monkeypatch):
-    module = load_vime_arguments_module(monkeypatch)
-    args = types.SimpleNamespace(
-        update_weight_transport="disk",
-        update_weight_disk_dir=None,
-        update_weight_delta_dir="/shared/delta",
-    )
-
-    with pytest.warns(UserWarning, match="will be removed in a future release"):
-        module._resolve_update_weight_disk_dir(args)
-
-    assert args.update_weight_disk_dir == "/shared/delta"
-    assert args.update_weight_delta_dir == "/shared/delta"
-
-
-@pytest.mark.unit
-def test_update_weight_disk_dir_backfills_legacy_delta_field(monkeypatch):
-    module = load_vime_arguments_module(monkeypatch)
-    args = types.SimpleNamespace(
-        update_weight_transport="disk",
-        update_weight_disk_dir="/shared/updates",
-        update_weight_delta_dir=None,
-    )
-
-    module._resolve_update_weight_disk_dir(args)
-
-    assert args.update_weight_disk_dir == "/shared/updates"
-    assert args.update_weight_delta_dir == "/shared/updates"
-
-
-@pytest.mark.unit
-def test_update_weight_disk_dir_rejects_conflicting_alias(monkeypatch):
-    module = load_vime_arguments_module(monkeypatch)
-    args = types.SimpleNamespace(
-        update_weight_transport="disk",
-        update_weight_disk_dir="/shared/full",
-        update_weight_delta_dir="/shared/delta",
-    )
-
-    with pytest.raises(ValueError, match="deprecated alias"):
-        module._resolve_update_weight_disk_dir(args)
+        module.vime_validate_args(args)
 
 
 def make_vime_validate_args(**overrides):
@@ -234,7 +187,6 @@ def make_vime_validate_args(**overrides):
         use_opd=False,
         opd_type=None,
         opd_teacher_load=None,
-        megatron_to_hf_mode="raw",
         load=None,
         hf_checkpoint="/tmp/hf",
         ref_ckpt_step=None,
@@ -277,9 +229,9 @@ def make_vime_validate_args(**overrides):
         debug_rollout_only=False,
         colocate=False,
         rollout_num_gpus=8,
-        train_memory_margin_bytes=0,
         eval_function_path=None,
         rollout_function_path="custom.rollout",
+        vllm_speculative_config=None,
         num_steps_per_rollout=None,
         rollout_batch_size=1,
         n_samples_per_prompt=1,
@@ -298,15 +250,74 @@ def make_vime_validate_args(**overrides):
         rollout_max_context_len=None,
         rollout_max_prompt_len=None,
         train_backend="megatron",
+        release_train=False,
+        keep_old_actor=False,
         only_train_params_name_list=None,
         freeze_params_name_list=None,
         update_weight_transport="nccl",
         update_weight_disk_dir=None,
-        update_weight_delta_dir=None,
+        update_weight_local_checkpoint_dir=None,
         update_weight_mode="full",
+        rollout_temperature=1.0,
     )
     values.update(overrides)
     return types.SimpleNamespace(**values)
+
+
+@pytest.mark.unit
+def test_vime_validate_args_preserves_explicit_start_rollout_id(monkeypatch):
+    """``--start-rollout-id`` is only a fallback when the user did not set it.
+
+    An explicit value is needed when there is no resumable Megatron checkpoint.
+    """
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(start_rollout_id=100)
+
+    module.vime_validate_args(args)
+
+    assert args.start_rollout_id == 100
+
+
+@pytest.mark.unit
+def test_vime_validate_args_defaults_start_rollout_id_to_zero(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(start_rollout_id=None)
+
+    module.vime_validate_args(args)
+
+    assert args.start_rollout_id == 0
+
+
+@pytest.mark.unit
+def test_vime_validate_args_derives_dspark_from_speculative_method(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(vllm_speculative_config={"method": "dspark"})
+
+    module.vime_validate_args(args)
+
+    assert args.dspark_enabled is True
+
+
+@pytest.mark.unit
+def test_vime_validate_args_rejects_equal_debug_data_paths(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(
+        save_debug_rollout_data="/tmp/debug_{rollout_id}.pt",
+        save_debug_train_data="/tmp/debug_{rollout_id}.pt",
+    )
+
+    with pytest.raises(ValueError, match="--save-debug-train-data must not be equal"):
+        module.vime_validate_args(args)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("temperature", [0.0, -0.1])
+def test_vime_validate_args_rejects_non_positive_rollout_temperature(monkeypatch, temperature):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(rollout_temperature=temperature)
+
+    with pytest.raises(ValueError, match="--rollout-temperature must be > 0"):
+        module.vime_validate_args(args)
 
 
 @pytest.mark.unit
@@ -322,7 +333,7 @@ def test_vime_validate_args_preserves_zero_rollout_gpus_under_colocate(monkeypat
 
 
 @pytest.mark.unit
-def test_vime_validate_args_rederives_mismatched_rollout_gpus_under_colocate(monkeypatch):
+def test_vime_validate_args_preserves_larger_rollout_gpus_under_colocate(monkeypatch):
     module = load_vime_arguments_module(monkeypatch)
     args = make_vime_validate_args(
         colocate=True,
@@ -333,7 +344,7 @@ def test_vime_validate_args_rederives_mismatched_rollout_gpus_under_colocate(mon
 
     module.vime_validate_args(args)
 
-    assert args.rollout_num_gpus == 8  # re-derived from actor_num_gpus_per_node * actor_num_nodes
+    assert args.rollout_num_gpus == 12
     assert args.offload_train is True
     assert args.offload_rollout is True
 
@@ -353,18 +364,70 @@ def test_vime_validate_args_preserves_zero_rollout_gpus_without_colocate(monkeyp
 
 
 @pytest.mark.unit
-def test_update_weight_delta_disabled(monkeypatch):
+def test_update_weight_delta_disk_is_valid(monkeypatch):
     module = load_vime_arguments_module(monkeypatch)
-    for transport, colocate in (("nccl", False), ("tensor", False), ("nccl", True)):
-        args = types.SimpleNamespace(
-            update_weight_mode="delta",
-            update_weight_transport=transport,
-            update_weight_disk_dir=None,
-            update_weight_delta_dir=None,
-            colocate=colocate,
-        )
-        with pytest.raises(NotImplementedError, match="unverified on vime"):
-            module._validate_update_weight_args(args)
+    args = make_vime_validate_args(
+        update_weight_mode="delta",
+        update_weight_transport="disk",
+        update_weight_disk_dir="/shared/delta",
+        update_weight_local_checkpoint_dir="/local/delta",
+    )
+
+    module.vime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_update_weight_delta_requires_disk_transport(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(
+        update_weight_mode="delta",
+        update_weight_transport="nccl",
+        update_weight_local_checkpoint_dir="/local/delta",
+    )
+
+    with pytest.raises(ValueError, match="requires --update-weight-transport=disk"):
+        module.vime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_update_weight_delta_rejects_colocate(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(
+        update_weight_mode="delta",
+        update_weight_transport="disk",
+        update_weight_disk_dir="/shared/delta",
+        update_weight_local_checkpoint_dir="/local/delta",
+        colocate=True,
+    )
+
+    with pytest.raises(ValueError, match="not supported with --colocate"):
+        module.vime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_update_weight_delta_requires_local_checkpoint_dir(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(
+        update_weight_mode="delta",
+        update_weight_transport="disk",
+        update_weight_disk_dir="/shared/delta",
+    )
+
+    with pytest.raises(ValueError, match="requires --update-weight-local-checkpoint-dir"):
+        module.vime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_force_fp8_ue8m0_scale_argument(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_vime_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    configured = parser.parse_args(["--rollout-batch-size", "1", "--force-fp8-ue8m0-scale"])
+
+    assert defaults.force_fp8_ue8m0_scale is False
+    assert configured.force_fp8_ue8m0_scale is True
 
 
 if __name__ == "__main__":

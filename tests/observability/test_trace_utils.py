@@ -1,0 +1,177 @@
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+from vime.observability.trace_utils import TRACE_CHILDREN_KEY, build_vllm_meta_trace_attrs, trace_span
+from vime.utils.types import Sample
+
+NUM_GPUS = 0
+
+
+def _load_trace_timeline_viewer_module():
+    module_path = Path(__file__).resolve().parents[2] / "tools" / "trace_timeline_viewer.py"
+    module_name = "test_trace_timeline_viewer_module"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None
+    assert spec.loader is not None
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.unit
+def test_build_vllm_meta_trace_attrs_keeps_standard_and_pd_fields():
+    meta = {
+        "prompt_tokens": 12,
+        "completion_tokens": 7,
+        "cached_tokens": 3,
+        "pd_prefill_forward_duration": 0.125,
+        "pd_decode_transfer_duration": 0.05,
+        "finish_reason": {"type": "stop"},
+        "unused_field": "ignored",
+    }
+
+    attrs = build_vllm_meta_trace_attrs(meta)
+    trace_children = attrs.pop(TRACE_CHILDREN_KEY)
+
+    assert attrs == {
+        "prompt_tokens": 12,
+        "completion_tokens": 7,
+        "cached_tokens": 3,
+        "finish_reason": "stop",
+    }
+    assert trace_children[0]["name"] == "vllm_pd_prefill"
+    assert trace_children[0]["children"][0]["attrs"] == {
+        "pd_prefill_forward_duration": 0.125,
+    }
+    assert trace_children[1]["name"] == "vllm_pd_decode"
+    assert trace_children[1]["children"][0]["attrs"] == {
+        "pd_decode_transfer_duration": 0.05,
+    }
+
+
+@pytest.mark.unit
+def test_build_vllm_meta_trace_attrs_normalizes_request_metrics():
+    attrs = build_vllm_meta_trace_attrs(
+        {
+            "request_metrics": {
+                "queue_time_ms": 100,
+                "time_to_first_token_ms": 200,
+                "generation_time_ms": 300,
+                "tokens_per_second": 20,
+                "remote_kv_wait_time_ms": 500,
+                "kv_allocation_wait_time_ms": 25,
+                "prefill_kv_allocation_wait_time_ms": 3,
+                "prefill_kv_initial_queue_wait_time_ms": 4,
+                "kv_initial_queue_wait_time_ms": 7,
+                "kv_post_receive_queue_wait_time_ms": 2,
+                "kv_transfer_worker_time_ms": 50,
+                "kv_handshake_wait_worker_time_ms": 12,
+            }
+        }
+    )
+    trace_children = attrs.pop(TRACE_CHILDREN_KEY, [])
+
+    assert attrs == {
+        "queue_time": pytest.approx(0.1),
+        "pd_decode_remote_kv_wait_duration": pytest.approx(0.5),
+        "pd_decode_allocation_wait_duration": pytest.approx(0.025),
+        "pd_prefill_allocation_wait_duration": pytest.approx(0.003),
+        "pd_prefill_initial_queue_wait_duration": pytest.approx(0.004),
+        "pd_decode_initial_queue_wait_duration": pytest.approx(0.007),
+        "pd_decode_post_receive_queue_wait_duration": pytest.approx(0.002),
+        "pd_transfer_worker_duration": pytest.approx(0.05),
+        "pd_handshake_wait_worker_duration": pytest.approx(0.012),
+        "e2e_latency": pytest.approx(0.6),
+        "decode_throughput": pytest.approx(20),
+    }
+    assert len(trace_children) == 1
+    assert trace_children[0]["name"] == "vllm_pd_decode"
+    assert [child["name"] for child in trace_children[0]["children"]] == [
+        "vllm_pd_decode_queue",
+        "vllm_pd_decode_ttft",
+        "vllm_pd_decode_generation",
+    ]
+    assert trace_children[0]["end_offset"] == pytest.approx(0.6)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("duration, speed", [(2.0, 0.5), (0.0, None), (None, None)])
+def test_transfer_speed_uses_measured_worker_duration(duration, speed):
+    attrs = build_vllm_meta_trace_attrs(
+        {"request_metrics": {"kv_transfer_bytes": 1_000_000, "kv_transfer_worker_time_ms": duration}}
+    )
+    summary = attrs[TRACE_CHILDREN_KEY][-1]["attrs"]
+    assert summary["pd_transfer_total_mb"] == 1
+    assert summary.get("pd_transfer_speed_gb_s") == speed
+
+
+@pytest.mark.unit
+def test_build_vllm_meta_trace_attrs_reads_tito_response():
+    attrs = build_vllm_meta_trace_attrs(
+        {
+            "request_id": "request-7",
+            "choices": [{"finish_reason": "length"}],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 3},
+            },
+        }
+    )
+    assert attrs == {
+        "vllm_request_id": "request-7",
+        "finish_reason": "length",
+        "prompt_tokens": 12,
+        "completion_tokens": 7,
+        "cached_tokens": 3,
+    }
+
+
+@pytest.mark.unit
+def test_trace_timeline_viewer_omits_virtual_pd_lanes_without_pd_attrs(tmp_path: Path):
+    viewer = _load_trace_timeline_viewer_module()
+    sample = Sample(index=0, prompt="hello")
+
+    with trace_span(sample, "vllm_generate", attrs={"max_new_tokens": 8}) as span:
+        span.update(
+            build_vllm_meta_trace_attrs(
+                {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 2,
+                    "cached_tokens": 1,
+                    "finish_reason": {"type": "stop"},
+                }
+            )
+        )
+
+    pt_path = tmp_path / "rollout.pt"
+    torch.save({"samples": [sample]}, pt_path)
+
+    cache = viewer._build_cache_data(pt_path)
+
+    assert cache["sample_count"] == 1
+    row = cache["rows"][0]
+    assert row["lane_count"] == 1
+    assert row["item_count"] == 1
+    assert row["closed_span_count"] == 1
+
+    item = row["items"][0]
+    assert item["name"] == "vllm_generate"
+    assert item["attrs"]["end_attrs"] == {
+        "prompt_tokens": 4,
+        "completion_tokens": 2,
+        "cached_tokens": 1,
+        "finish_reason": "stop",
+    }
+    assert "[P]" not in item["name"]
+    assert "[D]" not in item["name"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

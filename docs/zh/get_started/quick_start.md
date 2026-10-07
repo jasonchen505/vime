@@ -8,7 +8,11 @@
 
 ### 硬件支持说明
 
-**vime** 支持多种 NVIDIA GPU 硬件平台：
+**vime** 支持多种硬件平台。
+
+**NVIDIA GPU**：
+
+为目前稳定支持的硬件，包括：
 
 - **GB200 / GB300 / B200 / 300 系列**：完全支持，运行步骤与 H 系列完全相同
 - **H 系列 (H100/H200)**：官方支持，具有完整的 CI 测试保护，运行稳定可靠
@@ -17,7 +21,13 @@
 - 最新的 Docker 镜像对 B 卡和 H 卡通用，无需额外配置
 - Megatron 后端在 H 卡上具有 CI 保护，经过充分测试验证，推荐生产环境使用
 - B 卡基本功能稳定，可作为开发和测试参考，但暂无 CI 保护
-- 两种硬件平台使用完全相同的安装和启动流程
+- 两种 NVIDIA 硬件平台使用完全相同的安装和启动流程
+- 其它卡（如A100/A800）也可以运行，但暂不进行功能维护
+
+
+**AMD GPU**：
+
+请参考 [AMD 使用教程](../../en/platform_support/amd_tutorial.md)。
 
 ### 拉取并启动 Docker 容器
 
@@ -285,8 +295,8 @@ OPTIMIZER_ARGS=(
 ### VLLM_ARGS: vLLM 服务参数
 
 这部分参数用于配置 vLLM 推理服务。
-- `--rollout-num-gpus-per-engine`: 等同于 vLLM 的 `tp_size`。
-- 其他 vLLM 参数可以通过添加 `--vllm-` 前缀传递给 vime，vime 会自动透传给 vLLM。例如，要设置 vLLM 的 `--log-level INFO` 参数，只需使用 `--vllm-log-level INFO` 即可。
+- `--rollout-num-gpus-per-engine`：单个 rollout engine 使用的 worker GPU 总数；只有 data parallel 和 pipeline parallel 都为 1 时，它才等于 vLLM 的 `tensor_parallel_size`。
+- 其他 vLLM 参数可以通过添加 `--vllm-` 前缀传递给 vime，vime 会自动透传给 vLLM。例如，要设置 vLLM 的 `--uvicorn-log-level info` 参数，只需使用 `--vllm-uvicorn-log-level info`。
 
 > ⚠️ **注意**：
 > vime 使用 `vllm-router` 调度多个 vLLM 引擎。`dp_size` 会通过 `rollout-num-gpus / rollout-num-gpus-per-engine` 计算得到。

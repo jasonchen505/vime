@@ -49,9 +49,12 @@ def vllm_args() -> SimpleNamespace:
         fp16=False,
         offload_rollout=False,
         use_rollout_routing_replay=False,
+        rollout_top_p=1.0,
         vllm_pipeline_parallel_size=1,
+        vllm_prefill_context_parallel_size=1,
         vllm_data_parallel_size=1,
         vllm_dp_size=1,
+        vllm_enable_expert_parallel=False,
     )
 
 
@@ -89,6 +92,45 @@ class _MockResponse:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "first_response, expected_log",
+    [
+        (_MockResponse(json_data={"success": False}, text='{"success": false}'), "HTTP 200"),
+        (_MockResponse(status_code=503, text="busy"), "HTTP 503 'busy'"),
+    ],
+)
+def test_flush_cache_retries(vllm_engine, monkeypatch, caplog, first_response, expected_log):
+    responses = iter([first_response, _MockResponse(json_data={"success": True})])
+    calls = []
+    sleeps = []
+
+    def fake_post(url, *, params):
+        calls.append((url, params))
+        return next(responses)
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+    monkeypatch.setattr(mod.time, "sleep", sleeps.append)
+    with caplog.at_level("INFO", logger=mod.__name__):
+        vllm_engine.flush_cache()
+
+    assert calls == [("http://127.0.0.1:8765/reset_prefix_cache", {"reset_running_requests": True})] * 2
+    assert sleeps == [1]
+    assert expected_log in caplog.text
+
+
+@pytest.mark.unit
+def test_flush_cache_times_out_after_unsuccessful_resets(vllm_engine, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(mod.requests, "post", lambda *args, **kwargs: _MockResponse(json_data={"success": False}))
+    monkeypatch.setattr(mod.time, "sleep", sleeps.append)
+
+    with pytest.raises(TimeoutError, match="Timeout while flushing cache"):
+        vllm_engine.flush_cache()
+
+    assert sleeps == [1] * 60
+
+
+@pytest.mark.unit
 def test_normalize_vllm_wake_tags_drops_unsupported():
     assert mod._normalize_vllm_wake_tags(["weights", "cuda_graph", "kv_cache"]) == ["weights", "kv_cache"]
 
@@ -107,6 +149,10 @@ def test_launch_config_single_node(vllm_args):
     assert sa["nnodes"] == 1
     assert sa["node_rank"] == 0
     assert sa["_tp_size"] == 4
+    assert sa["_pp_size"] == 1
+    assert sa["_pcp_size"] == 1
+    assert sa["_dp_size"] == 1
+    assert sa["enable_per_request_metrics"] is True
 
 
 @pytest.mark.unit
@@ -171,7 +217,10 @@ def test_compute_server_args_applies_worker_type_and_bootstrap_port(vllm_args):
         worker_type="prefill",
         disaggregation_bootstrap_port=12345,
     )
-    assert sa_prefill["disaggregation_mode"] == "prefill"
+    assert sa_prefill["kv_transfer_config"] == {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_producer",
+    }
 
     sa_decode, _ = mod._compute_server_args(
         vllm_args,
@@ -181,7 +230,30 @@ def test_compute_server_args_applies_worker_type_and_bootstrap_port(vllm_args):
         port=8000,
         worker_type="decode",
     )
-    assert sa_decode["disaggregation_mode"] == "decode"
+    assert sa_decode["kv_transfer_config"] == {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_consumer",
+    }
+
+
+@pytest.mark.unit
+def test_compute_server_args_allows_mooncake_group_override(vllm_args):
+    config = {
+        "kv_connector": "MooncakeConnector",
+        "kv_role": "kv_producer",
+        "kv_connector_extra_config": {"device_name": "mlx5_0,mlx5_1"},
+    }
+    server_args, _ = mod._compute_server_args(
+        vllm_args,
+        rank=0,
+        dist_init_addr=None,
+        host="127.0.0.1",
+        port=8000,
+        worker_type="prefill",
+        disaggregation_bootstrap_port=12345,
+        vllm_overrides={"kv_transfer_config": config},
+    )
+    assert server_args["kv_transfer_config"] == config
 
 
 @pytest.mark.unit
@@ -200,9 +272,13 @@ def test_compute_server_args_prefill_requires_bootstrap_port(vllm_args):
 @pytest.mark.unit
 def test_compute_server_args_applies_rollout_and_dtype_flags(vllm_args):
     vllm_args.use_rollout_routing_replay = True
+    vllm_args.vllm_speculative_config = {"method": "mtp"}
+    vllm_args.rollout_top_p = 0.9
     vllm_args.fp16 = True
     sa, _ = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
     assert sa["enable_return_routed_experts"] is True
+    assert sa["per_request_spec_decode_metrics"] == "summary"
+    assert sa["return_sampling_mask"] is True
     assert sa["dtype"] == "float16"
 
 
@@ -257,11 +333,28 @@ def test_build_vllm_subprocess_env_colocate(vllm_args, monkeypatch):
 
 
 @pytest.mark.unit
+def test_build_vllm_subprocess_env_drops_trainer_allocator_config(vllm_args, monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+    env = mod._build_subprocess_env({"_args": vllm_args, "_visible_devices": "0"})
+
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in env
+    assert "PYTORCH_ALLOC_CONF" not in env
+
+
+@pytest.mark.unit
 def test_build_vllm_subprocess_env_sets_batch_invariant_when_deterministic(vllm_args, monkeypatch):
     monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
     vllm_args.vllm_enable_deterministic_inference = True
     env = mod._build_subprocess_env({"_args": vllm_args, "_visible_devices": "0"})
     assert env["VLLM_BATCH_INVARIANT"] == "1"
+
+
+@pytest.mark.unit
+def test_build_vllm_subprocess_env_enables_v2_runner_by_default(vllm_args):
+    env = mod._build_subprocess_env({"_args": vllm_args, "_visible_devices": "0"})
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
 @pytest.mark.unit
@@ -323,12 +416,28 @@ def test_start_weight_update_posts_four_phase_endpoint(vllm_engine, monkeypatch)
 
     monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
 
-    result = vllm_engine.start_weight_update(is_checkpoint_format=True)
+    result = vllm_engine.start_weight_update()
 
     assert result == {"ok": True}
     assert len(calls) == 1
     assert calls[0][0] == "start_weight_update"
-    assert calls[0][1] == {"is_checkpoint_format": True}
+    assert calls[0][1] == {}
+
+
+@pytest.mark.unit
+def test_start_draft_weight_update_posts_empty_body(vllm_engine, monkeypatch):
+    calls: list[tuple] = []
+
+    def fake_post(endpoint: str, payload: dict):
+        calls.append((endpoint, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
+
+    result = vllm_engine.start_draft_weight_update()
+
+    assert result == {"ok": True}
+    assert calls == [("start_draft_weight_update", {})]
 
 
 @pytest.mark.unit
@@ -348,7 +457,22 @@ def test_finish_weight_update_posts_empty_body(vllm_engine, monkeypatch):
 
 
 @pytest.mark.unit
-def test_update_weights_from_tensor_posts_ipc_payload_and_records_version(vllm_engine, monkeypatch):
+def test_finish_weight_update_commits_version(vllm_engine, monkeypatch):
+    calls: list[tuple] = []
+
+    def fake_post(endpoint: str, payload: dict):
+        calls.append((endpoint, payload))
+        return {"done": True}
+
+    monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
+
+    assert vllm_engine.finish_weight_update(weight_version="42") == {"done": True}
+    assert calls == [("finish_weight_update", {"weight_version": "42"})]
+    assert vllm_engine._weight_version == "42"
+
+
+@pytest.mark.unit
+def test_update_weights_posts_ipc_payload(vllm_engine, monkeypatch):
     posted: list[tuple[str, dict]] = []
 
     def fake_post(endpoint: str, payload: dict):
@@ -358,12 +482,14 @@ def test_update_weights_from_tensor_posts_ipc_payload_and_records_version(vllm_e
     monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
     assert vllm_engine._weight_version is None
 
-    vllm_engine.update_weights_from_tensor(
-        names=["layer.0.weight"],
-        dtype_names=["float32"],
-        shapes=[[2, 2]],
-        ipc_handles=[{"uuid-gpu0": ("rebuild_fn", (1, 2, 3))}],
-        weight_version="42",
+    vllm_engine.update_weights(
+        {
+            "names": ["a", "b"],
+            "dtype_names": ["bfloat16", "float32"],
+            "shapes": [[2], [1]],
+            "ipc_handles": {"uuid-gpu0": ("rebuild_fn", (1, 2, 3))},
+            "tensor_sizes": [4, 4],
+        }
     )
 
     assert posted[0][0] == "update_weights"
@@ -371,15 +497,50 @@ def test_update_weights_from_tensor_posts_ipc_payload_and_records_version(vllm_e
     # ipc_handles got cloudpickle'd into ipc_handles_pickled
     assert "ipc_handles" not in sent
     assert isinstance(sent["ipc_handles_pickled"], str)
-    assert sent["names"] == ["layer.0.weight"]
-    assert sent["shapes"] == [[2, 2]]
-    # version recorded after POST success
-    assert vllm_engine._weight_version == "42"
+    assert sent["names"] == ["a", "b"]
+    assert sent["shapes"] == [[2], [1]]
+    assert sent["tensor_sizes"] == [4, 4]
+    assert "packed" not in sent
+    assert vllm_engine._weight_version is None
 
 
 @pytest.mark.unit
-def test_update_weights_from_tensor_does_not_advance_version_on_failure(vllm_engine, monkeypatch):
-    """POST failure must not advance _weight_version (else a retry would skip the resync)."""
+def test_update_weights_serializes_rank_local_payloads(vllm_engine, monkeypatch):
+    posted: list[tuple[str, dict]] = []
+
+    def fake_post(endpoint: str, payload: dict):
+        posted.append((endpoint, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
+
+    first = {
+        "names": ["experts.0.weight"],
+        "dtype_names": ["bfloat16"],
+        "shapes": [[2]],
+        "ipc_handles": {"uuid-gpu0": ("first", ())},
+        "tensor_sizes": [4],
+    }
+    third = {
+        **first,
+        "names": ["experts.2.weight"],
+        "ipc_handles": {"uuid-gpu2": ("third", ())},
+    }
+    vllm_engine.update_weights([first, None, third])
+
+    sent = posted[0][1]["update_info"]
+    assert sent[1] is None
+    assert sent[0]["names"] == ["experts.0.weight"]
+    assert sent[2]["names"] == ["experts.2.weight"]
+    assert "ipc_handles" not in sent[0]
+    assert "ipc_handles" not in sent[2]
+    assert isinstance(sent[0]["ipc_handles_pickled"], str)
+    assert isinstance(sent[2]["ipc_handles_pickled"], str)
+
+
+@pytest.mark.unit
+def test_update_weights_does_not_advance_version_on_failure(vllm_engine, monkeypatch):
+    """Chunk POST failure must not modify the engine's committed version cache."""
 
     def fake_post_fail(endpoint: str, payload: dict) -> dict:
         raise RuntimeError("simulated POST failure")
@@ -388,24 +549,49 @@ def test_update_weights_from_tensor_does_not_advance_version_on_failure(vllm_eng
 
     vllm_engine._weight_version = "old"
     with pytest.raises(RuntimeError, match="simulated POST failure"):
-        vllm_engine.update_weights_from_tensor(
-            names=[], dtype_names=[], shapes=[], ipc_handles=[], weight_version="new"
+        vllm_engine.update_weights(
+            {"names": [], "dtype_names": [], "shapes": [], "ipc_handles": {}, "tensor_sizes": []}
         )
     assert vllm_engine._weight_version == "old"
 
 
 @pytest.mark.unit
-def test_get_weight_version_returns_recorded_version(vllm_engine):
-    vllm_engine._weight_version = "7"
+def test_get_weight_version_reads_vllm_weight_info(vllm_engine, monkeypatch):
+    monkeypatch.setattr(
+        mod.requests,
+        "get",
+        lambda *args, **kwargs: _MockResponse(json_data={"weight_version": "7"}),
+    )
+
     assert vllm_engine.get_weight_version() == "7"
+    assert vllm_engine._weight_version == "7"
 
 
 @pytest.mark.unit
-def test_get_weight_version_raises_when_unset(vllm_engine):
-    """Unrecorded version is a hard error — no silent /v1/models fallback."""
+def test_get_weight_version_preserves_uninitialized_none(vllm_engine, monkeypatch):
+    monkeypatch.setattr(
+        mod.requests,
+        "get",
+        lambda *args, **kwargs: _MockResponse(json_data={"weight_version": None}),
+    )
+
+    assert vllm_engine.get_weight_version() is None
     assert vllm_engine._weight_version is None
-    with pytest.raises(RuntimeError, match="before any successful weight transfer"):
-        vllm_engine.get_weight_version()
+
+
+@pytest.mark.unit
+def test_set_weight_version_updates_vllm_and_local_cache(vllm_engine, monkeypatch):
+    calls: list[tuple] = []
+
+    def fake_post(endpoint: str, payload: dict):
+        calls.append((endpoint, payload))
+        return {"success": True}
+
+    monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
+
+    assert vllm_engine.set_weight_version("9") == {"success": True}
+    assert calls == [("update_weight_version", {"new_version": "9"})]
+    assert vllm_engine._weight_version == "9"
 
 
 @pytest.mark.unit
@@ -434,9 +620,7 @@ def test_update_weights_from_distributed_posts_update_weights_without_checkpoint
         names,
         dtypes,
         shapes,
-        group_name="vime-pp_0",
         weight_version="7",
-        packed=True,
     )
 
     assert len(calls) == 1
@@ -446,13 +630,65 @@ def test_update_weights_from_distributed_posts_update_weights_without_checkpoint
     assert info["shapes"] == [[2, 2]]
     assert info["packed"] is True
     assert "is_checkpoint_format" not in info
-    assert vllm_engine._weight_version == "7"
+    assert vllm_engine._weight_version is None
 
 
 @pytest.mark.unit
-def test_get_url_ipv6_host(vllm_engine):
-    vllm_engine.server_host = "[2001:db8::1]"
-    assert vllm_engine.get_url() == "http://[2001:db8::1]:8765"
+@pytest.mark.parametrize(
+    ("host", "expected_host"),
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        ("2001:db8::1", "[2001:db8::1]"),
+        ("[2001:db8::1]", "[2001:db8::1]"),
+    ],
+)
+def test_init_formats_server_and_router_hosts_for_urls(vllm_engine, monkeypatch, host, expected_host):
+    server_args = {}
+    monkeypatch.setattr(vllm_engine, "_init_external", lambda args, **kwargs: server_args.update(args))
+
+    vllm_engine.init(
+        dist_init_addr="127.0.0.1:29500",
+        port=8765,
+        nccl_port=None,
+        host=host,
+        router_ip=host,
+        router_port=30000,
+    )
+
+    assert server_args["host"] == expected_host
+    assert vllm_engine.server_host == expected_host
+    assert vllm_engine.router_ip == expected_host
+    assert vllm_engine.get_url() == f"http://{expected_host}:8765"
+
+
+@pytest.mark.unit
+def test_launch_server_process_brackets_ipv6_health_url(vllm_args, monkeypatch):
+    process = SimpleNamespace(start=lambda: None, is_alive=lambda: True)
+    base_urls = []
+    subprocess_args = {}
+
+    monkeypatch.setattr(mod, "_build_subprocess_env", lambda _: {})
+    monkeypatch.setattr(mod.multiprocessing, "set_start_method", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        mod.multiprocessing,
+        "Process",
+        lambda *, target, args: subprocess_args.update(args[0]) or process,
+    )
+    monkeypatch.setattr(mod, "_wait_server_healthy", lambda base_url, **_: base_urls.append(base_url))
+
+    launched_process = mod.launch_server_process(
+        {
+            "_args": vllm_args,
+            "_visible_devices": "0",
+            "host": "[2001:db8::1]",
+            "port": 8000,
+            "node_rank": 0,
+        }
+    )
+
+    assert launched_process is process
+    assert subprocess_args["host"] == "2001:db8::1"
+    assert base_urls == ["http://[2001:db8::1]:8000"]
 
 
 @pytest.mark.unit
@@ -575,9 +811,72 @@ def test_update_weights_from_disk_posts_collective_rpc(vllm_engine, monkeypatch)
 
     monkeypatch.setattr(mod.requests, "post", fake_post)
 
-    assert vllm_engine.update_weights_from_disk("/tmp/model") == {"reloaded": True}
+    assert vllm_engine.update_weights_from_disk("/tmp/model", weight_version="8") == {"reloaded": True}
     assert seen[0][0] == "http://127.0.0.1:8765/collective_rpc"
     assert seen[0][3]["method"] == "reload_weights"
+    assert seen[1][0] == "http://127.0.0.1:8765/update_weight_version"
+    assert seen[1][3] == {"new_version": "8"}
+    assert vllm_engine._weight_version == "8"
+
+
+@pytest.mark.unit
+def test_pull_weights_posts_collective_rpc(vllm_engine, monkeypatch):
+    vllm_engine.args.update_weight_local_checkpoint_dir = "/local/checkpoint"
+    vllm_engine.args.update_weight_disk_dir = "/shared/checkpoints"
+    vllm_engine._weight_version = "old"
+    seen = []
+
+    def fake_post(url, *, json=None):
+        seen.append((url, json))
+        return _MockResponse(json_data={"success": True, "weight_version": "8"})
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    assert vllm_engine.pull_weights(8) == {"success": True, "weight_version": "8"}
+    assert seen == [
+        (
+            "http://127.0.0.1:8765/collective_rpc",
+            {
+                "method": "pull_weights",
+                "kwargs": {
+                    "local_checkpoint_dir": "/local/checkpoint",
+                    "source_dir": "/shared/checkpoints",
+                    "target_version": 8,
+                },
+            },
+        ),
+    ]
+    assert vllm_engine._weight_version == "old"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("operation", ["pull", "reload"])
+def test_disk_update_does_not_advance_version_on_failure(vllm_engine, monkeypatch, operation):
+    vllm_engine.args.update_weight_local_checkpoint_dir = "/local/checkpoint"
+    vllm_engine.args.update_weight_disk_dir = "/shared/checkpoints"
+    vllm_engine._weight_version = "old"
+
+    def fake_post(url, *, json=None):
+        del url, json
+        return _MockResponse(status_code=500)
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        if operation == "pull":
+            vllm_engine.pull_weights(8)
+        else:
+            vllm_engine.update_weights_from_disk("/local/checkpoint", weight_version="8")
+    assert vllm_engine._weight_version == "old"
+
+
+@pytest.mark.unit
+def test_profile_worker_rank_skips_http(vllm_engine, monkeypatch):
+    vllm_engine.node_rank = 1
+    monkeypatch.setattr(mod.requests, "post", lambda *args, **kwargs: pytest.fail("unexpected HTTP request"))
+
+    assert vllm_engine.start_profile() is None
+    assert vllm_engine.stop_profile() is None
 
 
 @pytest.mark.unit
@@ -597,8 +896,8 @@ def test_resolve_parallel_sizes_is_per_engine_not_global(vllm_args):
     vllm_args.rollout_num_gpus_per_engine = 1
     vllm_args.vllm_pipeline_parallel_size = 1
     vllm_args.vllm_tp_size = 1  # stale global; must be ignored now
-    tp, pp, dp = mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=2)
-    assert (tp, pp) == (2, 1)
+    tp, pp, pcp, dp = mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=2)
+    assert (tp, pp, pcp, dp) == (2, 1, 1, 1)
 
 
 @pytest.mark.unit
@@ -615,13 +914,13 @@ def test_launch_config_heterogeneous_per_group_tp(vllm_args):
 
 @pytest.mark.unit
 def test_resolve_parallel_sizes_dp_consumes_gpus(vllm_args):
-    # vLLM DP consumes GPUs (total = tp * pp * dp), so tp = gpus // (pp * dp).
+    # vLLM DP consumes GPUs (total = tp * pp * pcp * dp), so tp = gpus // (pp * pcp * dp).
     # dp=2, pp=1, 4 GPUs/engine → tp=2.
     vllm_args.vllm_pipeline_parallel_size = 1
     vllm_args.vllm_data_parallel_size = 2
     vllm_args.vllm_dp_size = 2
-    tp, pp, dp = mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=4)
-    assert (tp, pp) == (2, 1)
+    tp, pp, pcp, dp = mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=4)
+    assert (tp, pp, pcp, dp) == (2, 1, 1, 2)
 
 
 @pytest.mark.unit
@@ -630,8 +929,34 @@ def test_resolve_parallel_sizes_dp_and_pp_combined(vllm_args):
     vllm_args.vllm_pipeline_parallel_size = 2
     vllm_args.vllm_data_parallel_size = 2
     vllm_args.vllm_dp_size = 2
-    tp, pp, dp = mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=8)
-    assert (tp, pp) == (2, 2)
+    tp, pp, pcp, dp = mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=8)
+    assert (tp, pp, pcp, dp) == (2, 2, 1, 2)
+
+
+@pytest.mark.unit
+def test_resolve_parallel_sizes_pcp_consumes_gpus(vllm_args):
+    vllm_args.vllm_pipeline_parallel_size = 2
+    vllm_args.vllm_prefill_context_parallel_size = 2
+    vllm_args.vllm_data_parallel_size = 1
+    vllm_args.vllm_dp_size = 1
+
+    tp, pp, pcp, dp = mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=8)
+
+    assert (tp, pp, pcp, dp) == (2, 2, 2, 1)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("field", ["ep_size", "expert_parallel_size", "moe_dp_size", "moe_data_parallel_size"])
+def test_resolve_parallel_sizes_rejects_pseudo_expert_overrides(vllm_args, field):
+    with pytest.raises(ValueError, match="does not accept explicit EP/MoE-DP sizes"):
+        mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=4, overrides={field: 4})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("field", ["tp_size", "pp_size", "pcp_size", "dp_size"])
+def test_resolve_parallel_sizes_rejects_non_native_aliases(vllm_args, field):
+    with pytest.raises(ValueError, match="native field names"):
+        mod._resolve_parallel_sizes(vllm_args, gpus_per_engine=4, overrides={field: 1})
 
 
 @pytest.mark.unit

@@ -1,6 +1,6 @@
 # External Rollout Engines Roadmap
 
-An external rollout engine is an vLLM engine that is not launched by the vime training job. Another system deploys and owns the engine lifecycle; vime connects to those engines during training, registers a router, and syncs updated actor weights when needed.
+An external rollout engine is a vLLM engine that is not launched by the vime training job. Another system deploys and owns the engine lifecycle; vime connects to those engines during training, registers a router, and syncs updated actor weights when needed.
 
 This page is a roadmap. Use it to decide when to use `--rollout-external-engine-addrs`, when to stay with `--vllm-config`, and which weight-update path to pick for external deployments.
 
@@ -14,16 +14,17 @@ This page is a roadmap. Use it to decide when to use `--rollout-external-engine-
 | Trainer and external engines cannot form an NCCL group, but can see the same filesystem path | `--update-weight-mode full --update-weight-transport disk` |
 | Full checkpoints are too heavy for large-model cross-cluster or cross-DC sync | `--update-weight-mode delta --update-weight-transport disk` |
 | Rollout serving can use an independent vLLM environment, or even different GPU models/vendors | external engines + disk transport |
-| You want to validate delta wire/apply logic inside one datacenter | `--update-weight-mode delta --update-weight-transport nccl` |
 | You need frozen reference, reward, or tool-side models | Prefer `update_weights: false` in [vLLM Config](vllm-config.md#3-multi-model-serving) |
+
+Delta mode supports disk transport only. Use full mode when syncing weights over NCCL.
 
 ## What External Engine Does
 
 First launch vLLM servers independently:
 
 ```bash
-python -m vllm.launch_server --model-path /path/to/model --port 10090 ...
-python -m vllm.launch_server --model-path /path/to/model --port 10091 ...
+VLLM_SERVER_DEV_MODE=1 vllm serve /path/to/model --port 10090 ...
+VLLM_SERVER_DEV_MODE=1 vllm serve /path/to/model --port 10091 ...
 ```
 
 Then pass those addresses to the training job:
@@ -67,6 +68,8 @@ Full-checkpoint update from disk is the simplest fallback path for external depl
 
 At every weight sync, the trainer writes a complete HF checkpoint directory under `--update-weight-disk-dir`, such as `weight_v000123/`, then calls each vLLM engine's `update_weights_from_disk` endpoint over HTTP so the engine reloads the checkpoint without a process restart.
 
+Adding `--update-weight-local-checkpoint-dir` makes each engine first pull the published checkpoint onto every host it spans (`/pull_weights`, shipped in vime's vllm patch) and reload from local disk (e.g. NVMe) — one shared-filesystem read per host instead of one per rank, which matters when the shared dir is object-store-backed or the engine spans several nodes.
+
 This mode has a simple control plane: it does not require an NCCL group between trainer and engines. It only requires both sides to see the same shared filesystem path. The tradeoff is size: every sync writes the full actor weights, which is expensive for large models or frequent updates.
 
 For debugging, add:
@@ -79,28 +82,16 @@ This keeps the full-checkpoint directories after engines acknowledge the load.
 
 ## Update With Delta
 
-Delta update targets large-model training/inference disaggregation across clusters or datacenters. Instead of writing a full checkpoint, the trainer keeps a pinned-CPU snapshot of the previous sync, detects byte-level changes, and sends only changed positions and values.
-
-Recommended for cross-cluster / shared-filesystem deployments:
+Delta update targets large-model training/inference disaggregation across clusters or datacenters. Instead of writing a full checkpoint every sync, the trainer keeps a CPU snapshot of the previous sync, diffs each parameter against it, and publishes only the changed bytes; each engine's `/pull_weights` endpoint (shipped in vime's vllm patch) applies the delta into a host-local checkpoint on every host the engine spans, and the engine reloads via the vanilla `update_weights_from_disk` endpoint. vime only calls the engine's HTTP endpoint, so multi-node external engines work the same as vime-launched ones.
 
 ```bash
 --update-weight-mode delta
 --update-weight-transport disk
---update-weight-encoding deltas_zstd
 --update-weight-disk-dir /shared/fs/delta-updates
+--update-weight-local-checkpoint-dir /local/nvme/rollout-ckpt
 ```
 
-With disk transport, each sync writes sparse safetensors under `weight_v{N:06d}/`, then calls `update_weights_from_disk(load_format="delta")`. vLLM overwrites only changed positions in the current weights; unchanged positions stay in place.
-
-For intra-datacenter validation or bandwidth-rich environments, NCCL transport is also available:
-
-```bash
---update-weight-mode delta
---update-weight-transport nccl
---update-weight-encoding indices
-```
-
-For encoding choices, wire layout, receiver-side selective overwrite, and tuning parameters, see [Delta Weight Sync](delta-weight-sync.md).
+See [Delta Weight Sync](delta-weight-sync.md) for the mechanism, encodings, integrity checks, and shared-filesystem visibility hooks.
 
 ## Deployment Checklist
 

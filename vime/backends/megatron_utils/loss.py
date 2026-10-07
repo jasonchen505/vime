@@ -37,6 +37,49 @@ ROLLOUT_TOP_P_TOKEN_KEYS = (
 )
 
 
+# Optional capture of per-sample policy log-probs computed during the training
+# forward. Used only when dumping train debug data in configs that skip the
+# separate log-prob recompute (can_reuse_log_probs_in_loss / use_rollout_logprobs):
+# the values are identical to a separate compute_log_prob pass, so we snapshot
+# them here at no extra forward. Keyed by GLOBAL rollout position so the writer
+# can put them back in sample order regardless of pipeline/microbatch order.
+_LOG_PROB_CAPTURE: "dict[int, torch.Tensor] | None" = None
+
+
+def enable_log_prob_capture() -> None:
+    """Start capturing training-forward log-probs (call before ``train``)."""
+    global _LOG_PROB_CAPTURE
+    _LOG_PROB_CAPTURE = {}
+
+
+def drain_captured_log_probs() -> "dict[int, torch.Tensor]":
+    """Return captured ``{rollout_position: cp-local log_probs}`` and stop capturing."""
+    global _LOG_PROB_CAPTURE
+    captured = _LOG_PROB_CAPTURE or {}
+    _LOG_PROB_CAPTURE = None
+    return captured
+
+
+def _maybe_capture_log_probs(batch: RolloutBatch, log_probs: list[torch.Tensor]) -> None:
+    """Snapshot per-sample CP-local ``log_probs`` keyed by global rollout position.
+
+    No-op unless :func:`enable_log_prob_capture` is active and the micro-batch
+    carries ``partition`` (only added to the training keys when dumping). First
+    occurrence per position wins, so multi-step training keeps the initial
+    (old-policy) values. ``log_probs`` here is the per-sample list, in the same
+    order as ``batch['partition']`` (both indexed by this micro-batch's
+    ``micro_batch_indices``).
+    """
+    if _LOG_PROB_CAPTURE is None:
+        return
+    positions = batch.get("partition")
+    if not positions:
+        return
+    for position, log_prob in zip(positions, log_probs, strict=True):
+        if position not in _LOG_PROB_CAPTURE:
+            _LOG_PROB_CAPTURE[position] = log_prob.detach().clone()
+
+
 def get_rollout_top_p_logprob_kwargs(args: Namespace, batch: dict[str, Any]) -> dict[str, Any]:
     if args.rollout_top_p == 1.0:
         return {}
@@ -44,7 +87,7 @@ def get_rollout_top_p_logprob_kwargs(args: Namespace, batch: dict[str, Any]) -> 
     top_p_token_ids = batch.get("rollout_top_p_token_ids")
     top_p_token_offsets = batch.get("rollout_top_p_token_offsets")
     if top_p_token_ids is None or top_p_token_offsets is None:
-        return {}
+        raise ValueError("rollout_top_p != 1.0 requires rollout_top_p_token_ids and rollout_top_p_token_offsets.")
     return {
         "top_p_token_ids": top_p_token_ids,
         "top_p_token_offsets": top_p_token_offsets,
@@ -202,7 +245,7 @@ def _allgather_cp_redistribute(
                     response_length,
                     dtype=ref_dtype,
                     device=ref_device,
-                    requires_grad=True,
+                    requires_grad=ref_value.requires_grad,
                 )
             else:
                 resp_start = s - logit_global_start
@@ -213,7 +256,7 @@ def _allgather_cp_redistribute(
             full_resps.append(full_resp)
             seq_start += total_length
 
-        # Single differentiable all-reduce to gather full response from all CP ranks
+        # Single differentiable all-reduce to gather full response from all CP ranks.
         all_cat = torch.cat(full_resps, dim=0)
         all_cat = dist.nn.all_reduce(all_cat, group=cp_group)
 
@@ -444,9 +487,9 @@ def _extract_per_sample(
             s = max(logit_global_start, chunk_start)
             e = min(logit_global_end, chunk_end)
             if e <= s:
-                log_probs_list.append(torch.zeros((0,), dtype=log_prob_full.dtype, device=log_prob_full.device))
+                log_probs_list.append(log_prob_full[:0])
                 if entropy_full is not None:
-                    entropy_list.append(torch.zeros((0,), dtype=entropy_full.dtype, device=entropy_full.device))
+                    entropy_list.append(entropy_full[:0])
             else:
                 log_probs_list.append(log_prob_full[s - chunk_start : e - chunk_start])
                 if entropy_full is not None:
@@ -485,8 +528,8 @@ def get_log_probs_and_entropy(
     per-sample slicing) so backward traverses ``[T, V]`` only once, then
     extracts per-sample response portions.
 
-    When ``entropy_coef == 0``, entropy is computed under ``torch.no_grad()``
-    to avoid retaining the computation graph and to skip cloning.
+    If rollout top-p replay is provided, the keep-mask is applied only to
+    log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
     assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -503,6 +546,9 @@ def get_log_probs_and_entropy(
     device = logits.device
     tp_group = mpu.get_tensor_model_parallel_group()
     chunk_size = args.log_probs_chunk_size
+    # Keep entropy metrics, but skip saving entropy-backward activations when
+    # the entropy term cannot affect the loss.
+    with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
 
     # --- build full shifted-token target tensor ---
     full_tokens = _build_shifted_tokens(T, device, unconcat_tokens, total_lengths, response_lengths, args.allgather_cp)
@@ -527,6 +573,7 @@ def get_log_probs_and_entropy(
         full_tokens,
         tp_group,
         with_entropy=with_entropy,
+        with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
     )
@@ -662,7 +709,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     estimator. Supported methods: "grpo", "gspo", "cispo", "ppo",
     "reinforce_plus_plus", and "reinforce_plus_plus_baseline". When
     `args.normalize_advantages` is True, advantages are whitened across the
-    data-parallel group using masked statistics.
+    data-parallel-with-context-parallel group using masked statistics.
 
     Early returns if both `log_probs` and `values` are None (intermediate
     pipeline stages).
@@ -724,11 +771,11 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         rewards = []
         kl_coef = -args.kl_coef
         cp_rank = mpu.get_context_parallel_rank()
-        for reward, k in zip(old_rewards, kl, strict=False):
-            k *= kl_coef
+        for reward, per_token_kl in zip(old_rewards, kl, strict=False):
+            token_level_rewards = per_token_kl * kl_coef
             if cp_rank == 0:
-                k[-1] += reward
-            rewards.append(k)
+                token_level_rewards[-1] += reward
+            rewards.append(token_level_rewards)
         advantages, returns = get_advantages_and_returns_batch(
             total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
         )
@@ -751,7 +798,6 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         advantages = get_reinforce_plus_plus_baseline_advantages(
             rewards=rewards,
             kl=kl,
-            loss_masks=loss_masks,
             kl_coef=args.kl_coef,
         )
         returns = advantages
@@ -805,20 +851,30 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
             all_masks = torch.cat(mask_chunks)
 
-        if all_masks.numel() > 0:
-            assert (
-                all_advs.size() == all_masks.size()
-            ), f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
-            dp_group = mpu.get_data_parallel_group()
+        assert (
+            all_advs.size() == all_masks.size()
+        ), f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
+        # `all_advs` / `all_masks` only cover the tokens this CP rank owns, so the
+        # statistics must be reduced over the DP group *with* context parallel.
+        # The CP-excluding group makes every CP rank whiten its own zigzag slice
+        # with its own mean/var, i.e. the two halves of one sequence get
+        # different affine transforms.
+        #
+        # This has to stay unconditional: a CP rank can legitimately own zero
+        # response tokens (prompt-heavy sequences put both of its chunks inside
+        # the prompt), and skipping the collective on just that rank would
+        # desync the all_reduce. `distributed_masked_whiten` handles an empty
+        # local tensor — it contributes 0 to the reduced sums.
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
 
-            whitened_advs_flat = distributed_masked_whiten(
-                all_advs,
-                all_masks,
-                process_group=dp_group,
-                shift_mean=True,
-            )
-            chunk_lengths = [chunk.size(0) for chunk in advantages]
-            advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
+        whitened_advs_flat = distributed_masked_whiten(
+            all_advs,
+            all_masks,
+            process_group=dp_cp_group,
+            shift_mean=True,
+        )
+        chunk_lengths = [chunk.size(0) for chunk in advantages]
+        advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
@@ -921,6 +977,10 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    # Snapshot the per-sample policy log-probs for the train debug dump (no-op
+    # unless capture is enabled). Must run before the torch.cat below rebinds
+    # `log_probs` to a single concatenated tensor.
+    _maybe_capture_log_probs(batch, log_probs)
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]
     train_log_probs_for_tis = batch.get("log_probs")
@@ -974,7 +1034,13 @@ def policy_loss_function(
     if args.advantage_estimator == "cispo":
         pg_loss, pg_clipfrac = compute_cispo_loss(ppo_kl, log_probs, advantages, args.eps_clip, args.eps_clip_high)
     else:
-        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+        pg_loss, pg_clipfrac = compute_policy_loss(
+            ppo_kl,
+            advantages,
+            args.eps_clip,
+            args.eps_clip_high,
+            eps_clip_c=args.eps_clip_c,
+        )
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -1069,7 +1135,8 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        log_probs_to_compare = log_probs if args.use_rollout_logprobs else old_log_probs
+        train_rollout_logprob_abs_diff = sum_of_sample_mean((log_probs_to_compare - rollout_log_probs).abs())
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -1098,7 +1165,7 @@ def policy_loss_function(
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
 
     # Add OPD metrics if available
-    if "opd_reverse_kl" in batch:
+    if batch.get("opd_reverse_kl"):
         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
 

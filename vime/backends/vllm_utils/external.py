@@ -25,6 +25,26 @@ class ExternalEngineInfo:
     def is_pd_worker(self) -> bool:
         return self.worker_type in ("prefill", "decode")
 
+    @property
+    def parallel_config(self) -> dict[str, int | bool]:
+        pp_size = int(self.server_info.get("pp_size") or self.server_info.get("pipeline_parallel_size") or 1)
+        pcp_size = int(self.server_info.get("pcp_size") or self.server_info.get("prefill_context_parallel_size") or 1)
+        dp_size = int(self.server_info.get("dp_size") or self.server_info.get("data_parallel_size") or 1)
+        tp_size = int(
+            self.server_info.get("tp_size")
+            or self.server_info.get("tensor_parallel_size")
+            or self.num_gpus // (pp_size * pcp_size * dp_size)
+        )
+        enable_expert_parallel = bool(self.server_info.get("enable_expert_parallel", False))
+        return {
+            "tp_size": tp_size,
+            "pp_size": pp_size,
+            "pcp_size": pcp_size,
+            "dp_size": dp_size,
+            "enable_expert_parallel": enable_expert_parallel,
+            "ep_size": tp_size * pcp_size * dp_size if enable_expert_parallel else 1,
+        }
+
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
@@ -57,14 +77,68 @@ def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
 
 def get_server_info(url: str, timeout: float = 30.0) -> dict:
     errors = []
-    for endpoint in ("/server_info", "/get_server_info"):
+    for endpoint in ("/server_info?config_format=json", "/server_info", "/get_server_info"):
         try:
             response = requests.get(f"{url}{endpoint}", timeout=timeout)
             response.raise_for_status()
-            return response.json()
+            return _normalize_server_info(response.json())
         except Exception as exc:
             errors.append(f"{endpoint}: {exc}")
     raise RuntimeError(f"Failed to fetch vLLM server info from {url}: {'; '.join(errors)}")
+
+
+def _normalize_server_info(server_info: dict) -> dict:
+    vllm_config = server_info.get("vllm_config")
+    if not isinstance(vllm_config, dict):
+        vllm_config = server_info
+
+    normalized = dict(server_info)
+    for section in vllm_config.values():
+        if not isinstance(section, dict):
+            continue
+        for key, value in section.items():
+            normalized.setdefault(key, value)
+
+    def find_config_value(config, name):
+        if not isinstance(config, dict):
+            return None
+        if name in config:
+            return config[name]
+        for value in config.values():
+            found = find_config_value(value, name)
+            if found is not None:
+                return found
+        return None
+
+    kv_transfer_config = find_config_value(vllm_config, "kv_transfer_config")
+    if kv_transfer_config is not None:
+        normalized["kv_transfer_config"] = kv_transfer_config
+    weight_transfer_config = find_config_value(vllm_config, "weight_transfer_config")
+    if weight_transfer_config is not None:
+        normalized["weight_transfer_config"] = weight_transfer_config
+    ec_transfer_config = find_config_value(vllm_config, "ec_transfer_config")
+    if ec_transfer_config is not None:
+        normalized["ec_transfer_config"] = ec_transfer_config
+    if (
+        isinstance(ec_transfer_config, dict)
+        and ec_transfer_config.get("ec_connector") is not None
+        and ec_transfer_config.get("ec_role") == "ec_producer"
+    ):
+        normalized["encoder_only"] = True
+    if isinstance(kv_transfer_config, dict):
+        role = kv_transfer_config.get("kv_role")
+        if role == "kv_producer":
+            normalized["disaggregation_mode"] = "prefill"
+        elif role == "kv_consumer":
+            normalized["disaggregation_mode"] = "decode"
+
+    vllm_env = server_info.get("vllm_env")
+    if isinstance(vllm_env, dict):
+        bootstrap_port = vllm_env.get("VLLM_NIXL_SIDE_CHANNEL_PORT")
+        if bootstrap_port is not None:
+            normalized["disaggregation_bootstrap_port"] = bootstrap_port
+
+    return normalized
 
 
 def _infer_worker_type(server_info: dict) -> str:
@@ -85,8 +159,14 @@ def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[E
         server_info = get_server_info(url, timeout=timeout)
 
         pp_size = int(server_info.get("pp_size") or server_info.get("pipeline_parallel_size") or 1)
+        pcp_size = int(server_info.get("pcp_size") or server_info.get("prefill_context_parallel_size") or 1)
+        dp_size = int(server_info.get("dp_size") or server_info.get("data_parallel_size") or 1)
         tp_size = int(server_info.get("tp_size") or server_info.get("tensor_parallel_size") or 1)
-        num_gpus = int(server_info.get("num_gpus") or server_info.get("num_gpus_per_engine") or tp_size * pp_size)
+        num_gpus = int(
+            server_info.get("num_gpus")
+            or server_info.get("num_gpus_per_engine")
+            or tp_size * pp_size * pcp_size * dp_size
+        )
         bootstrap_port = server_info.get("disaggregation_bootstrap_port")
         bootstrap_port = int(bootstrap_port) if bootstrap_port is not None else None
 
@@ -138,6 +218,7 @@ class ExternalRolloutServer:
     engines: list
     engine_gpu_counts: list[int]
     engine_gpu_offsets: list[int]
+    engine_parallel_configs: list[dict[str, int]]
     router_ip: str | None = None
     router_port: int | None = None
     model_name: str = "default"
@@ -182,7 +263,15 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
     from vime.ray.utils import add_default_ray_env_vars
 
     infos = external_engine_infos_from_args(args)
-    router_ip, router_port = start_router(args, has_pd_disaggregation=any(info.is_pd_worker for info in infos))
+    has_pd_disaggregation = any(info.is_pd_worker for info in infos)
+    prefill_urls = [(info.url, info.disaggregation_bootstrap_port) for info in infos if info.worker_type == "prefill"]
+    decode_urls = [info.url for info in infos if info.worker_type == "decode"]
+    router_ip, router_port, _ = start_router(
+        args,
+        has_pd_disaggregation=has_pd_disaggregation,
+        prefill_urls=prefill_urls if has_pd_disaggregation else None,
+        decode_urls=decode_urls if has_pd_disaggregation else None,
+    )
     args.vllm_router_ip = router_ip
     args.vllm_router_port = router_port
 
@@ -211,8 +300,8 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
         init_handles.append(
             rollout_engine.init.remote(
                 **external_engine_init_kwargs(info),
-                router_ip=router_ip,
-                router_port=router_port,
+                router_ip=None if has_pd_disaggregation else router_ip,
+                router_port=None if has_pd_disaggregation else router_port,
             )
         )
 
@@ -222,6 +311,7 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
             engines=engines,
             engine_gpu_counts=engine_gpu_counts,
             engine_gpu_offsets=engine_gpu_offsets,
+            engine_parallel_configs=[info.parallel_config for info in infos],
             router_ip=router_ip,
             router_port=router_port,
             model_name="default",

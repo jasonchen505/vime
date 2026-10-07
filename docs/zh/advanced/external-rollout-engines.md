@@ -14,16 +14,17 @@ External rollout engine 指的是：vLLM engine 不由 vime 训练任务启动�
 | 训练器和 external engine 不能建立 NCCL group，但能共享同一路径的文件系统 | `--update-weight-mode full --update-weight-transport disk` |
 | 大模型跨集群或跨数据中心同步，full checkpoint 太重 | `--update-weight-mode delta --update-weight-transport disk` |
 | rollout serving 想使用独立 vLLM 环境，甚至不同型号或不同厂家的 GPU | external engine + disk transport |
-| 想验证 delta wire/apply 逻辑，但仍在同一数据中心内 | `--update-weight-mode delta --update-weight-transport nccl` |
 | 需要 reference、reward、tool-side model 等冻结模型 | 优先用 [vLLM Config](vllm-config.md#3-多模型服务) 的 `update_weights: false` |
+
+delta mode 仅支持 disk transport。通过 NCCL 同步权重时请使用 full mode。
 
 ## External Engine 做了什么
 
 使用 external engine 时，先独立启动 vLLM server：
 
 ```bash
-python -m vllm.launch_server --model-path /path/to/model --port 10090 ...
-python -m vllm.launch_server --model-path /path/to/model --port 10091 ...
+VLLM_SERVER_DEV_MODE=1 vllm serve /path/to/model --port 10090 ...
+VLLM_SERVER_DEV_MODE=1 vllm serve /path/to/model --port 10091 ...
 ```
 
 训练任务里传入这些地址：
@@ -67,6 +68,8 @@ full checkpoint update from disk 是 external 场景最简单的兜底路径：
 
 每次权重同步时，训练端会在 `--update-weight-disk-dir` 下写一个完整 HF checkpoint 目录，例如 `weight_v000123/`，然后通过 HTTP 调用每个 vLLM engine 的 `update_weights_from_disk`，让 engine 在不重启进程的情况下重新加载 checkpoint。
 
+额外设置 `--update-weight-local-checkpoint-dir` 后，每个 engine 会先把发布的 checkpoint pull 到它覆盖的每个 host 的本地磁盘（`/pull_weights`，随 vime 的 vllm patch 提供），再从本地（如 NVMe）reload——共享文件系统每个 host 只读一次，而不是每个 rank 读一次；当共享目录是对象存储或 engine 跨多个节点时尤其重要。
+
 这个模式的优点是控制面简单：不要求训练器和 engine 建 NCCL group，只要求二者能看到同一个共享文件系统路径。缺点也直接：每次同步都写完整 actor 权重，对大模型和高频同步来说非常重。
 
 调试时可以加：
@@ -79,28 +82,16 @@ full checkpoint update from disk 是 external 场景最简单的兜底路径：
 
 ## Update With Delta
 
-delta update 面向大模型、跨集群或跨数据中心训推解耦。它不写完整 checkpoint，而是在训练端保留上一次同步后的 pinned CPU snapshot，逐字节检测变化，只发送变化位置和值。
-
-跨集群 / 共享文件系统推荐：
+delta update 面向大模型、跨集群或跨数据中心训推解耦。它不每次都写完整 checkpoint，而是在训练端保留上一次同步的 CPU snapshot，逐参数比对，只发布变化的字节；每个 engine 的 `/pull_weights` 端点（随 vime 的 vllm patch 提供）把 delta apply 进 engine 覆盖的每个 host 的本地 checkpoint，再通过原生 `update_weights_from_disk` 端点 reload。vime 只调用 engine 的 HTTP 端点，所以多节点 external engine 与 vime 拉起的 engine 行为一致。
 
 ```bash
 --update-weight-mode delta
 --update-weight-transport disk
---update-weight-encoding deltas_zstd
 --update-weight-disk-dir /shared/fs/delta-updates
+--update-weight-local-checkpoint-dir /local/nvme/rollout-ckpt
 ```
 
-在 disk transport 下，每次同步会写一组稀疏 safetensors 到 `weight_v{N:06d}/`，然后调用 `update_weights_from_disk(load_format="delta")`。vLLM 侧只把变化位置覆写到当前权重上，不变位置保持原值。
-
-在同一数据中心内做实现验证或带宽不紧张时，也可以用 NCCL transport：
-
-```bash
---update-weight-mode delta
---update-weight-transport nccl
---update-weight-encoding indices
-```
-
-编码如何选择、delta wire layout、接收端 selective overwrite 以及调优参数见 [Delta 权重同步](delta-weight-sync.md)。
+机制、编码、完整性校验以及共享文件系统可见性 hook 详见 [Delta 权重同步](delta-weight-sync.md)。
 
 ## 部署检查清单
 

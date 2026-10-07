@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from aiohttp import ClientError, web
 from aiohttp.test_utils import TestClient, TestServer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,7 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.test_agent._fakes import FakeTokenizer, FakeVLLMServer  # noqa: E402
 
-from vime.agent.adapters import anthropic, openai  # noqa: E402
+from vime.agent.adapters import anthropic, common, openai  # noqa: E402
 from vime.agent.parsing import parse_model_output, parse_xml_tool_uses  # noqa: E402
 from vime.utils.types import Sample  # noqa: E402
 
@@ -170,7 +173,7 @@ def test_anthropic_messages_nonstream_records_token_segments():
         async with FakeVLLMServer([[(-0.1, 101), (-0.2, 102)]]) as vllm:
             tok = FakeTokenizer(outputs={(101, 102): "done now"})
             adapter = anthropic.AnthropicAdapter(tokenizer=tok, vllm_url=vllm.url)
-            adapter.open_session("sid-a")
+            adapter.open_session("sid-a", sampling_defaults={"min_new_tokens": 2, "repetition_penalty": 1.2})
             client = TestClient(TestServer(adapter.app))
             await client.start_server()
             try:
@@ -189,6 +192,8 @@ def test_anthropic_messages_nonstream_records_token_segments():
         assert data["content"] == [{"type": "text", "text": "done now"}]
         # adapter posted the rendered prompt ids and capped max_tokens at the request cap.
         assert vllm.requests[0]["sampling_params"]["max_tokens"] == 7
+        assert vllm.requests[0]["sampling_params"]["min_tokens"] == 2
+        assert vllm.requests[0]["sampling_params"]["repetition_penalty"] == 1.2
         assert vllm.routing_keys == ["sid-a"]
         # one trained turn: the two response ids carry loss=1 + real logprobs.
         assert len(samples) == 1
@@ -197,6 +202,50 @@ def test_anthropic_messages_nonstream_records_token_segments():
         assert s.loss_mask[-2:] == [1, 1]
         assert s.rollout_log_probs[-2:] == [-0.1, -0.2]
         assert s.response == "done now"
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+def test_session_sampling_defaults_reach_vllm(protocol):
+    defaults = {
+        "max_new_tokens": 20,
+        "min_new_tokens": 2,
+        "repetition_penalty": 1.2,
+        "top_p": 0.9,
+        "top_k": -1,
+    }
+
+    async def run_case():
+        async with FakeVLLMServer([[(-0.1, 101)]]) as vllm:
+            adapter_cls = anthropic.AnthropicAdapter if protocol == "anthropic" else openai.OpenAIAdapter
+            adapter = adapter_cls(tokenizer=FakeTokenizer(outputs={(101,): "done"}), vllm_url=vllm.url)
+            adapter.open_session("sampling", sampling_defaults=defaults)
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages" if protocol == "anthropic" else "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sampling"},
+                    json={"model": "m", "max_tokens": 7, "messages": [{"role": "user", "content": "hi"}]},
+                )
+                await response.json()
+                assert response.status == 200
+            finally:
+                await client.close()
+            await _drain(adapter, "sampling")
+
+        sampling_params = vllm.requests[0]["sampling_params"]
+        expected = {
+            "max_tokens": 7,
+            "min_tokens": 2,
+            "repetition_penalty": 1.2,
+            "top_p": 0.9,
+            "top_k": -1,
+            "logprobs": 1,
+        }
+        assert {key: sampling_params[key] for key in expected} == expected
+        assert defaults["max_new_tokens"] == 20
 
     asyncio.run(run_case())
 
@@ -435,9 +484,10 @@ def test_parse_model_output_plain_text_no_parsers():
 def test_parse_model_output_think_split_fallback():
     # The qwen3 reasoning parser lives in vllm (lazy import); skip where the
     # lean CPU CI env has no vllm installed.
-    pytest.importorskip("vllm")
+    pytest.importorskip("vllm.entrypoints.openai.chat_completion.protocol")
     parsed = parse_model_output(
         "<think>reason here</think>visible",
+        tokenizer=SimpleNamespace(get_vocab=lambda: {"<think>": 0, "</think>": 1}),
         tools_schema=None,
         tool_parser_name=None,
         reasoning_parser_name="qwen3",
@@ -461,6 +511,31 @@ def test_parse_xml_tool_uses_ignores_unknown_tool():
     cleaned, uses = parse_xml_tool_uses(raw, [{"function": {"name": "lookup"}}])
     assert uses == []
     assert "<tool_call>" in cleaned  # left untouched
+
+
+def test_upstream_disconnect_does_not_cancel_caller():
+    async def disconnect(request):
+        request.transport.close()
+        return web.Response()
+
+    async def run():
+        app = web.Application()
+        app.router.add_post("/inference/v1/generate", disconnect)
+        async with TestServer(app) as server:
+            adapter = SimpleNamespace(
+                logger=logging.getLogger(__name__),
+                log_prefix="test",
+                max_token_keys=("max_tokens",),
+                stop_keys=("stop",),
+                vllm_url=str(server.make_url("/")).rstrip("/"),
+            )
+            session = SimpleNamespace(sampling_defaults={}, max_context_tokens=0)
+            with pytest.raises(ClientError):
+                await common.call_vllm_generate([1], session, {}, adapter=adapter)
+            assert asyncio.current_task().cancelling() == 0
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

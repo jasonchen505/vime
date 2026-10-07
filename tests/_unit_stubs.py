@@ -104,8 +104,32 @@ def install_vllm_router_stub() -> None:
         return
 
     class RouterArgs:
+        # Stub of vllm_router.RouterArgs for CPU unit tests when the real package is absent.
         @classmethod
-        def add_cli_args(cls, parser, *args, **kwargs):  # noqa: ARG003
+        def add_cli_args(
+            cls, parser, *args, use_router_prefix=False, exclude_host_port=False, **kwargs
+        ):  # noqa: ARG003
+            prefix = "router-" if use_router_prefix else ""
+            dprefix = "router_" if use_router_prefix else ""
+            parser.add_argument(
+                f"--{prefix}log-level",
+                dest=f"{dprefix}log_level",
+                default=None,
+                choices=["debug", "info", "warning", "error", "critical"],
+            )
+            parser.add_argument(
+                f"--{prefix}policy",
+                dest=f"{dprefix}policy",
+                type=str,
+                default="cache_aware",
+                choices=["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"],
+            )
+            parser.add_argument(
+                f"--{prefix}request-timeout-secs",
+                dest=f"{dprefix}request_timeout_secs",
+                type=int,
+                default=1800,
+            )
             return parser
 
         @classmethod
@@ -170,6 +194,7 @@ def install_megatron_mpu_stub() -> MagicMock:
     mpu_stub.get_tensor_model_parallel_world_size.return_value = 2
     mpu_stub.get_tensor_model_parallel_group.return_value = "tp_group"
     mpu_stub.get_pipeline_model_parallel_rank.return_value = 0
+    mpu_stub.get_pipeline_model_parallel_world_size.return_value = 1
     mpu_stub.get_expert_model_parallel_world_size.return_value = 1
     mpu_stub.get_expert_model_parallel_group.return_value = "ep_group"
 
@@ -209,6 +234,9 @@ def install_ray_stub() -> None:
 
 def install_vllm_cli_stubs() -> None:
     """Stub vLLM CLI/parser imports for ``vime.backends.vllm_utils.arguments`` when vLLM is absent."""
+    # arguments.py imports RouterArgs at module load, so the router stub must be present too.
+    install_vllm_router_stub()
+
     if real_module_available("vllm"):
         return
 
@@ -217,6 +245,11 @@ def install_vllm_cli_stubs() -> None:
 
     utils_mod = types.ModuleType("vllm.utils")
     argparse_utils = types.ModuleType("vllm.utils.argparse_utils")
+    deep_gemm = types.ModuleType("vllm.utils.deep_gemm")
+    deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor = MagicMock()
+    deep_gemm.get_tma_aligned_size = MagicMock()
+    deep_gemm.is_deep_gemm_e8m0_used = MagicMock(return_value=False)
+    deep_gemm.per_block_cast_to_fp8 = MagicMock()
 
     import argparse
 
@@ -225,6 +258,7 @@ def install_vllm_cli_stubs() -> None:
 
     argparse_utils.FlexibleArgumentParser = FlexibleArgumentParser
     utils_mod.argparse_utils = argparse_utils
+    utils_mod.deep_gemm = deep_gemm
 
     engine_mod = types.ModuleType("vllm.engine")
     engine_mod.__path__ = []
@@ -246,7 +280,9 @@ def install_vllm_cli_stubs() -> None:
     entrypoints_mod.__path__ = []
     openai_mod = types.ModuleType("vllm.entrypoints.openai")
     openai_mod.__path__ = []
-    cli_args_mod = types.ModuleType("vllm.entrypoints.openai.cli_args")
+    launchers_mod = types.ModuleType("vllm.entrypoints.launchers")
+    launchers_mod.__path__ = []
+    cli_args_mod = types.ModuleType("vllm.entrypoints.launchers.cli_args")
 
     import dataclasses as _dc
 
@@ -259,8 +295,9 @@ def install_vllm_cli_stubs() -> None:
     cli_args_mod.FrontendArgs = FrontendArgs
     cli_args_mod.make_arg_parser = lambda parser=None: parser
     cli_args_mod.validate_parsed_serve_args = lambda args: args
-    openai_mod.cli_args = cli_args_mod
+    launchers_mod.cli_args = cli_args_mod
     entrypoints_mod.openai = openai_mod
+    entrypoints_mod.launchers = launchers_mod
     vllm_mod.entrypoints = entrypoints_mod
 
     cli_mod = types.ModuleType("vllm.entrypoints.cli")
@@ -280,12 +317,14 @@ def install_vllm_cli_stubs() -> None:
     sys.modules["vllm"] = vllm_mod
     sys.modules["vllm.utils"] = utils_mod
     sys.modules["vllm.utils.argparse_utils"] = argparse_utils
+    sys.modules["vllm.utils.deep_gemm"] = deep_gemm
     sys.modules["vllm.utils.system_utils"] = system_utils_mod
     sys.modules["vllm.engine"] = engine_mod
     sys.modules["vllm.engine.arg_utils"] = arg_utils
     sys.modules["vllm.entrypoints"] = entrypoints_mod
     sys.modules["vllm.entrypoints.openai"] = openai_mod
-    sys.modules["vllm.entrypoints.openai.cli_args"] = cli_args_mod
+    sys.modules["vllm.entrypoints.launchers"] = launchers_mod
+    sys.modules["vllm.entrypoints.launchers.cli_args"] = cli_args_mod
     sys.modules["vllm.entrypoints.cli"] = cli_mod
     sys.modules["vllm.entrypoints.cli.serve"] = serve_mod
 

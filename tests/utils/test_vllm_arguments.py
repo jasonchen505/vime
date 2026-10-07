@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import logging
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,7 +36,10 @@ def _ns(**overrides):
     base = dict(
         vllm_data_parallel_size=1,
         vllm_pipeline_parallel_size=1,
+        vllm_prefill_context_parallel_size=1,
         rollout_num_gpus_per_engine=4,
+        rollout_top_k=-1,
+        rollout_top_p=1.0,
         vllm_router_ip=None,
     )
     base.update(overrides)
@@ -52,7 +58,7 @@ def test_validate_args_pp1(args_mod):
 @pytest.mark.unit
 def test_validate_args_records_pp_dp_but_no_global_tp(args_mod):
     # validate_args records pp/dp on the namespace but must not precompute a global TP, even when
-    # pp>1 and dp>1. Per-engine TP = gpus_per_engine // (pp * dp) is resolved at launch time.
+    # pp>1 and dp>1. Per-engine TP = gpus_per_engine // (pp * pcp * dp) is resolved at launch time.
     ns = _ns(vllm_pipeline_parallel_size=2, vllm_data_parallel_size=2)
     args_mod.validate_args(ns)
     assert ns.vllm_pp_size == 2
@@ -96,13 +102,23 @@ def test_validate_args_router_none_noop(args_mod):
 
 
 @pytest.mark.unit
+def test_validate_args_accepts_unbounded_top_p_replay(args_mod):
+    args_mod.validate_args(_ns(rollout_top_p=0.95))
+
+
+@pytest.mark.unit
+def test_validate_args_accepts_bounded_top_p_replay(args_mod):
+    args_mod.validate_args(_ns(rollout_top_p=0.95, rollout_top_k=20))
+
+
+@pytest.mark.unit
 def test_add_vllm_router_arguments_registers_vllm_prefix(args_mod):
     parser = argparse.ArgumentParser(add_help=False)
     args_mod.add_vllm_router_arguments(parser)
     flags = {s for a in parser._actions for s in a.option_strings}
     assert "--vllm-router-ip" in flags
     assert "--vllm-router-port" in flags
-    assert "--router-request-timeout-secs" in flags
+    assert "--vllm-router-request-timeout-secs" in flags
 
 
 @pytest.mark.unit
@@ -112,7 +128,7 @@ def test_add_vllm_router_arguments_dests(args_mod):
     dests = {a.dest for a in parser._actions if a.option_strings}
     assert "vllm_router_ip" in dests
     assert "vllm_router_port" in dests
-    assert "router_request_timeout_secs" in dests
+    assert "vllm_router_request_timeout_secs" in dests
 
 
 @pytest.mark.unit
@@ -132,19 +148,61 @@ def test_add_vllm_router_arguments_parses_real_values(args_mod):
     parser = argparse.ArgumentParser(add_help=False)
     args_mod.add_vllm_router_arguments(parser)
     parsed, _ = parser.parse_known_args(
-        ["--vllm-router-ip", "10.0.0.1", "--vllm-router-port", "8000", "--router-request-timeout-secs", "30"]
+        ["--vllm-router-ip", "10.0.0.1", "--vllm-router-port", "8000", "--vllm-router-request-timeout-secs", "30"]
     )
     assert parsed.vllm_router_ip == "10.0.0.1"
     assert parsed.vllm_router_port == 8000
-    assert parsed.router_request_timeout_secs == 30
+    assert parsed.vllm_router_request_timeout_secs == 30
 
 
 @pytest.mark.unit
-def test_add_vllm_router_arguments_defaults_to_consistent_hash(args_mod):
+def test_add_vllm_router_arguments_defaults_to_cache_aware(args_mod):
     parser = argparse.ArgumentParser(add_help=False)
     args_mod.add_vllm_router_arguments(parser)
     parsed, _ = parser.parse_known_args([])
-    assert parsed.router_policy == "consistent_hash"
+    assert parsed.router_policy == "cache_aware"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("flags, expected", [([], "warning"), (["--router-log-level", "debug"], "debug")])
+def test_router_log_level_survives_launch(args_mod, monkeypatch, flags, expected):
+    from vllm_router.router_args import RouterArgs
+
+    parser = argparse.ArgumentParser(add_help=False)
+    args_mod.add_vllm_router_arguments(parser)
+    args = parser.parse_args(flags)
+    assert args.router_log_level == expected
+    router_args = SimpleNamespace(log_level=args.router_log_level)
+    monkeypatch.setattr(RouterArgs, "from_cli_args", lambda *args, **kwargs: router_args)
+    launches = []
+
+    def make_process(*, target, args):
+        launches.append(args[0])
+        return SimpleNamespace(start=lambda: None, is_alive=lambda: True)
+
+    source_path = Path(args_mod.__file__).with_name("deployment.py")
+    source = ast.parse(source_path.read_text())
+    function = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == "_start_router")
+    namespace = {
+        "random": random,
+        "logger": logging.getLogger(__name__),
+        "find_available_port": lambda port: port,
+        "time": SimpleNamespace(sleep=lambda seconds: None),
+        "multiprocessing": SimpleNamespace(Process=make_process),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source_path), "exec"), namespace)
+    namespace["_start_router"](args, bind=("127.0.0.1", 30000))
+    assert launches[0].log_level == expected
+
+
+@pytest.mark.unit
+def test_add_vllm_arguments_overrides_router_balance_threshold_defaults(args_mod, monkeypatch):
+    _patch_device_config(monkeypatch)
+    parser = argparse.ArgumentParser(add_help=False)
+    args_mod.add_vllm_arguments(parser)
+    parsed, _ = parser.parse_known_args([])
+    assert parsed.router_balance_abs_threshold == 10
+    assert parsed.router_balance_rel_threshold == 1.2
 
 
 def _patch_device_config(monkeypatch):
@@ -166,7 +224,8 @@ def test_add_vllm_arguments_prefixes_regular_engine_flags(args_mod, monkeypatch)
     flags = {s for a in parser._actions for s in a.option_strings}
     assert "--vllm-server-concurrency" in flags
     assert "--vllm-tool-call-parser" in flags
-    assert "--vllm-weight-sync-packed" in flags
+    assert "--vllm-weight-sync-packed" not in flags
+    assert "--no-vllm-weight-sync-packed" not in flags
 
 
 @pytest.mark.unit
@@ -227,7 +286,7 @@ def test_parse_args_default_attribute_set_even_without_register(args_mod, monkey
 
 @pytest.mark.unit
 def test_parse_args_tp_default_with_dp(args_mod, monkeypatch):
-    """TP auto-compute must divide by DP: TP = gpus / (PP * DP)."""
+    """TP auto-compute must divide by DP: TP = gpus / (PP * PCP * DP)."""
     monkeypatch.setattr(args_mod, "add_vllm_arguments", lambda p: p)
     monkeypatch.setattr(
         sys,
@@ -236,6 +295,28 @@ def test_parse_args_tp_default_with_dp(args_mod, monkeypatch):
     )
     ns = args_mod.vllm_parse_args()
     assert ns.vllm_tensor_parallel_size == 2  # 8 / (1 * 4) = 2
+
+
+@pytest.mark.unit
+def test_parse_args_tp_default_with_pcp_and_dp(args_mod, monkeypatch):
+    monkeypatch.setattr(args_mod, "add_vllm_arguments", lambda p: p)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--rollout-num-gpus-per-engine",
+            "8",
+            "--vllm-prefill-context-parallel-size",
+            "2",
+            "--vllm-data-parallel-size",
+            "2",
+        ],
+    )
+
+    ns = args_mod.vllm_parse_args()
+
+    assert ns.vllm_tensor_parallel_size == 2
 
 
 @pytest.mark.unit

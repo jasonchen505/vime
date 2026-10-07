@@ -23,11 +23,14 @@ Two protocol chains are covered:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import dataclasses
+import importlib.util
 import sys
 import types
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,7 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 # CPU-only CI env for this test. We never touch a real tokenizer (load_tokenizer
 # is patched with FakeTokenizer below), so stub transformers before the import
 # so the chain resolves without it.
-if "transformers" not in sys.modules:
+if "transformers" not in sys.modules and importlib.util.find_spec("transformers") is None:
     _tf_stub = types.ModuleType("transformers")
     for _name in ("AutoProcessor", "AutoTokenizer", "PreTrainedTokenizerBase", "ProcessorMixin"):
         setattr(_tf_stub, _name, type(_name, (), {}))
@@ -74,6 +77,49 @@ from vime.utils.misc import SingletonMeta  # noqa: E402
 from vime.utils.types import Sample  # noqa: E402
 
 NUM_GPUS = 0
+
+
+@pytest.mark.parametrize(
+    "exit_stage, expected_count", [("solver", 2), ("rewriter", 4), ("selector", 4), ("complete", 5)]
+)
+def test_multi_agent_emits_shared_rollout_id(exit_stage, expected_count):
+    source_path = REPO_ROOT / "examples/multi_agent/agent_system.py"
+    source = ast.parse(source_path.read_text())
+    function = next(
+        node for node in source.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_agent_system"
+    )
+
+    async def solver_worker(args, problem_statement, worker_id):
+        args.results_dict["solver"].append(Sample(index=worker_id, prompt=problem_statement))
+        return None if exit_stage == "solver" else "solution"
+
+    async def rewrite_worker(args, previous_solutions, problem_statement, worker_id):
+        args.results_dict["rewriter"].append(Sample(index=worker_id, prompt=problem_statement))
+        return None if exit_stage == "rewriter" else "rewritten"
+
+    async def batched_async_rm(args, samples):
+        return [1.0] * len(samples)
+
+    class SelectorAgent:
+        async def select(self, args, problem_statement, solutions):
+            if exit_stage != "selector":
+                args.results_dict["selector"].append(Sample(index=0, prompt=problem_statement))
+            return None
+
+    namespace = {
+        "asyncio": asyncio,
+        "deepcopy": deepcopy,
+        "solver_worker": solver_worker,
+        "rewrite_worker": rewrite_worker,
+        "batched_async_rm": batched_async_rm,
+        "SelectorAgent": SelectorAgent,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source_path), "exec"), namespace)
+    args = SimpleNamespace(num_parallel=2, incorrect_reward_weight=0.5, correct_reward_weight=1.0)
+    samples = asyncio.run(namespace["run_agent_system"](args, Sample(index=37, prompt="problem")))
+    assert len(samples) == expected_count
+    assert all(sample.rollout_id == 37 for sample in samples)
+
 
 _REAL_SLEEP = asyncio.sleep
 

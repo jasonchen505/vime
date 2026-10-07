@@ -1,4 +1,5 @@
 import sys
+import types
 from argparse import Namespace
 from pathlib import Path
 
@@ -8,7 +9,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vime.backends.vllm_utils.external import apply_external_engine_info_to_args, discover_external_engines
+from vime.backends.vllm_utils.external import (
+    ExternalEngineInfo,
+    apply_external_engine_info_to_args,
+    discover_external_engines,
+    get_server_info,
+    start_external_rollout_servers,
+)
 from vime.utils.http_utils import get_rollout_num_engines
 
 NUM_GPUS = 0
@@ -30,13 +37,14 @@ class _Response:
 def test_discover_external_engines_reads_server_info(monkeypatch):
     def fake_get(url, timeout):
         assert timeout == 30.0
-        assert url == "http://host1:10090/server_info"
+        assert url == "http://host1:10090/server_info?config_format=json"
         return _Response(
             {
                 "tp_size": 4,
                 "pp_size": 2,
+                "pcp_size": 1,
                 "dp_size": 1,
-                "ep_size": 4,
+                "enable_expert_parallel": True,
                 "disaggregation_mode": "null",
             }
         )
@@ -55,24 +63,145 @@ def test_discover_external_engines_reads_server_info(monkeypatch):
     assert info.server_info["tp_size"] == 4
     assert info.server_info["pp_size"] == 2
     assert info.server_info["dp_size"] == 1
-    assert info.server_info["ep_size"] == 4
+    assert info.server_info["enable_expert_parallel"] is True
+    assert info.parallel_config == {
+        "tp_size": 4,
+        "pp_size": 2,
+        "pcp_size": 1,
+        "dp_size": 1,
+        "enable_expert_parallel": True,
+        "ep_size": 4,
+    }
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "ec_connector, ec_role, kv_role, expected",
+    [
+        ("ECExampleConnector", "ec_producer", None, "encoder"),
+        ("ECExampleConnector", "ec_consumer", "kv_producer", "prefill"),
+        ("ECExampleConnector", "ec_consumer", "kv_consumer", "decode"),
+        ("ECExampleConnector", "ec_both", None, "regular"),
+        (None, "ec_producer", None, "regular"),
+    ],
+)
+def test_discover_external_native_ec_roles(monkeypatch, nested, ec_connector, ec_role, kv_role, expected):
+    config = {
+        "ec_transfer_config": {"ec_connector": ec_connector, "ec_role": ec_role},
+        "kv_transfer_config": {"kv_role": kv_role},
+        "parallel_config": {"tensor_parallel_size": 1},
+    }
+    payload = {"vllm_config": config} if nested else config
+    monkeypatch.setattr("vime.backends.vllm_utils.external.requests.get", lambda *args, **kwargs: _Response(payload))
+
+    info = discover_external_engines(["host1:10090"])[0]
+
+    assert info.worker_type == expected
+    assert info.server_info["ec_transfer_config"] == config["ec_transfer_config"]
+
+
+def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch):
+    class FakeActor:
+        init = Namespace(remote=lambda **kwargs: kwargs)
+
+    class FakeActorClass:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, **kwargs):
+            return FakeActor()
+
+    ray = types.ModuleType("ray")
+    ray.remote = lambda actor_class: FakeActorClass()
+    vllm_engine = types.ModuleType("vime.backends.vllm_utils.vllm_engine")
+    vllm_engine.VLLMEngine = object
+    ray_utils = types.ModuleType("vime.ray.utils")
+    ray_utils.add_default_ray_env_vars = lambda: {}
+    monkeypatch.setitem(sys.modules, "ray", ray)
+    monkeypatch.setitem(sys.modules, "vime.backends.vllm_utils.vllm_engine", vllm_engine)
+    monkeypatch.setitem(sys.modules, "vime.ray.utils", ray_utils)
+
+    info = ExternalEngineInfo(
+        url="http://host1:10090",
+        host="host1",
+        port=10090,
+        worker_type="regular",
+        num_gpus=8,
+        server_info={
+            "tp_size": 2,
+            "pp_size": 2,
+            "pcp_size": 1,
+            "dp_size": 2,
+            "enable_expert_parallel": True,
+        },
+    )
+    args = Namespace(rollout_external_engine_infos=[info.to_dict()])
+
+    servers, init_handles = start_external_rollout_servers(
+        args,
+        start_router=lambda *args, **kwargs: ("host1", 30000, None),
+    )
+
+    assert servers["default"].engine_parallel_configs == [
+        {
+            "tp_size": 2,
+            "pp_size": 2,
+            "pcp_size": 1,
+            "dp_size": 2,
+            "enable_expert_parallel": True,
+            "ep_size": 4,
+        }
+    ]
+    assert len(init_handles) == 1
+
+
+def test_get_server_info_flattens_nested_vllm_transfer_configs(monkeypatch):
+    def fake_get(url, timeout):
+        assert url == "http://host1:10090/server_info?config_format=json"
+        assert timeout == 30.0
+        return _Response(
+            {
+                "vllm_config": {
+                    "parallel_config": {"tensor_parallel_size": 2},
+                    "model_config": {
+                        "kv_transfer_config": {
+                            "kv_connector": "NixlConnector",
+                            "kv_role": "kv_producer",
+                        },
+                        "weight_transfer_config": {"backend": "nccl"},
+                    },
+                },
+                "vllm_env": {"VLLM_NIXL_SIDE_CHANNEL_PORT": 12090},
+            }
+        )
+
+    monkeypatch.setattr("vime.backends.vllm_utils.external.requests.get", fake_get)
+    server_info = get_server_info("http://host1:10090")
+
+    assert server_info["tensor_parallel_size"] == 2
+    assert server_info["kv_transfer_config"]["kv_role"] == "kv_producer"
+    assert server_info["weight_transfer_config"] == {"backend": "nccl"}
+    assert server_info["disaggregation_mode"] == "prefill"
+    assert server_info["disaggregation_bootstrap_port"] == 12090
 
 
 def test_apply_external_engine_info_handles_pd(monkeypatch):
     payloads = {
-        "http://prefill:10090/server_info": {
+        "http://prefill:10090/server_info?config_format=json": {
             "tp_size": 2,
             "pp_size": 1,
+            "pcp_size": 1,
             "dp_size": 1,
-            "ep_size": 1,
+            "enable_expert_parallel": False,
             "disaggregation_mode": "prefill",
             "disaggregation_bootstrap_port": 12090,
         },
-        "http://decode:10091/server_info": {
+        "http://decode:10091/server_info?config_format=json": {
             "tp_size": 4,
             "pp_size": 1,
+            "pcp_size": 1,
             "dp_size": 2,
-            "ep_size": 2,
+            "enable_expert_parallel": True,
             "disaggregation_mode": "decode",
         },
     }
@@ -86,10 +215,6 @@ def test_apply_external_engine_info_handles_pd(monkeypatch):
         rollout_external_engine_addrs=["prefill:10090", "decode:10091"],
         rollout_num_gpus=None,
         rollout_num_gpus_per_engine=1,
-        vllm_pipeline_parallel_size=1,
-        vllm_data_parallel_size=1,
-        vllm_expert_parallel_size=1,
-        vllm_enable_dp_attention=False,
         router_pd_disaggregation=False,
     )
 
@@ -97,18 +222,18 @@ def test_apply_external_engine_info_handles_pd(monkeypatch):
 
     assert args.rollout_external is True
     assert args.router_pd_disaggregation is False
-    assert args.rollout_num_gpus == 6
+    assert args.rollout_num_gpus == 10
     assert args.rollout_num_engines == 2
     assert get_rollout_num_engines(args) == 2
     assert [info["worker_type"] for info in args.rollout_external_engine_infos] == ["prefill", "decode"]
-    assert [info["num_gpus"] for info in args.rollout_external_engine_infos] == [2, 4]
+    assert [info["num_gpus"] for info in args.rollout_external_engine_infos] == [2, 8]
     assert [info["server_info"]["dp_size"] for info in args.rollout_external_engine_infos] == [1, 2]
     assert args.rollout_external_engine_infos[0]["disaggregation_bootstrap_port"] == 12090
 
 
 def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     def fake_get(url, timeout):
-        assert url == "http://regular:10090/server_info"
+        assert url == "http://regular:10090/server_info?config_format=json"
         return _Response(
             {
                 "tp_size": 2,
