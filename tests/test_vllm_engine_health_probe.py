@@ -77,6 +77,7 @@ class WaitServerHealthyTest(unittest.TestCase):
                 probe_timeout=1.5,
             )
         get.assert_called_once_with("http://127.0.0.1:8000/health", timeout=1.5)
+
     def test_unresponsive_server_does_not_block_liveness_check(self):
         # The probe raises ConnectTimeout on every attempt while the server
         # process dies: the loop must surface the dead process instead of
@@ -104,4 +105,3 @@ class WaitServerHealthyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
